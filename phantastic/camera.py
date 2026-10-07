@@ -30,6 +30,7 @@ import numpy as np
 
 from . import protocol as P
 from .cine import CineWriter
+from .defects import convert
 from .crop import check_crop, crop_image, crop_note
 
 log = logging.getLogger(__name__)
@@ -303,7 +304,7 @@ class Camera:
         return v if isinstance(v, dict) else {'c0': v}
 
     def cine_info(self, cine: int) -> dict:
-        keys = ('state', 'firstfr', 'lastfr', 'frcount', 'res', 'rate', 'exp', 'ptframes', 'trigtime')
+        keys = ('state', 'firstfr', 'lastfr', 'frcount', 'res', 'rate', 'exp', 'edrexp', 'ptframes', 'trigtime')
         out = {}
         for k in keys:
             try:
@@ -495,14 +496,17 @@ class Camera:
     def download(self, cine: int, path, first: int | None = None, last: int | None = None, step: int = 1,
                  fmt: str = 'P16', align: str = 'trigger', chunk: int = 64,
                  progress: Callable[[int, int], None] | None = None, description: str = '',
-                 as_12bit: bool = False, crop=None) -> dict:
+                 as_12bit: bool = False, crop=None, fill_flags: bool = True) -> dict:
         """Download a stored cine (or a decimated range of it) into a new .cine file, losslessly.
 
         ``as_12bit`` (P16/P16R only): store value >> 4 as 12-bit data, the layout of PCC's own files
         (PCC shows a 16-bit file almost white). P16R is exactly 12-bit x 16, so this is lossless for it.
         A v2512 fills P16's low 4 bits with the fraction left by its FPN/PRNU correction (93.6 % of
         pixels, 2026-10-07); those are dropped (floor) and counted in the returned ``dropped_low_bits``.
-        Whether PCC floors or rounds is not yet verified.
+        PCC floors too: a PCC save of the same cine matched on every unflagged pixel (2026-10-07).
+
+        ``fill_flags`` (P16 only): pixels the camera flags as defective (0xFF00) get PCC's fill-in, the
+        8-neighbour mean (see :mod:`phantastic.defects`); the count is returned and written in the Description.
 
         ``step``/``align`` choose the kept image numbers explicitly: 'trigger' keeps numbers that
         are multiples of ``step`` (PCC's rule, measured), 'first' keeps first, first+step, ...
@@ -555,7 +559,7 @@ class Camera:
             black, white = PCC_BLACK_12 * 16, PCC_WHITE_12 * 16
         else:
             black, white = 0, (1 << bits) - 1
-        fields = dict(FrameRate=rate_i, FrameRateInt1516=rate_i, FrameRateDouble=float(ci['rate'] or 0), ShutterNs=exp_ns, PostTrigger=pt, ImWidth=out_w, ImHeight=out_h,
+        fields = dict(EDRShutterNs=int(ci.get('edrexp') or 0), FrameRate=rate_i, FrameRateInt1516=rate_i, FrameRateDouble=float(ci['rate'] or 0), ShutterNs=exp_ns, PostTrigger=pt, ImWidth=out_w, ImHeight=out_h,
                       # legacy 16-bit copies: with FrameRate16 = 0 the vendor reader reports 10 fps
                       # (measured 2026-10-07); PCC writes min(value, 65535) and whole microseconds
                       FrameRate16=min(rate_i, 0xFFFF), PostTrigger16=min(pt, 0xFFFF),
@@ -574,18 +578,23 @@ class Camera:
             # ImPosXAcq/ImPosYAcq are NOT used for the offset: their meaning is not established (all 143
             # PCC cines on the lab drive, 2026-10-07, hold 0 there although recorded below full sensor size).
             fields['Description'] += ' ' + crop_note(crop, res.width, res.height)
+        if fill_flags and fmt == 'P16':
+            fields['Description'] += (' Pixels the camera flags as defective (0xFF00 in P16) are replaced by the mean of '
+                                      'their 8 neighbours, as PCC does.')
         out_first, offset = renumbering(numbers, step) if step > 1 else (int(numbers[0]), 0)
         if step > 1:
             fields['Description'] += f' Image k = camera image k*{step}+{offset} (a cine numbers images consecutively).'
         try:
-            dropped = self._write_download(path, (out_w, out_h), numbers, packing, out_first, fields, tsec, frac64,
-                                           ci, have_times, cine, fmt, chunk, year0, as_12bit, progress, crop)
+            dropped, filled = self._write_download(path, (out_w, out_h), numbers, packing, out_first, fields, tsec,
+                                                   frac64, ci, have_times, cine, fmt, chunk, year0, as_12bit,
+                                                   progress, crop, fill_flags)
         except BaseException:
             Path(path).unlink(missing_ok=True)      # never leave a partial file that looks complete
             raise
         return dict(cine=cine, path=str(path), fmt=fmt, first=int(numbers[0]), last=int(numbers[-1]),
                     count=len(numbers), step=step, align=align, offset=offset, first_out=out_first,
                     camera=ci, times=have_times, as_12bit=as_12bit, dropped_low_bits=dropped, crop=crop,
+                    fill_flags=fill_flags and fmt == 'P16', flagged_filled=filled,
                     width=out_w, height=out_h)
 
     def stored_cines(self) -> list[int]:
@@ -654,13 +663,14 @@ class Camera:
         return out
 
     def _write_download(self, path, size, numbers, packing, out_first, fields, tsec, frac64, ci, have_times,
-                        cine, fmt, chunk, year0, as_12bit, progress, crop=None):
+                        cine, fmt, chunk, year0, as_12bit, progress, crop=None, fill_flags=False):
         with CineWriter(path, size[0], size[1], len(numbers), packing, first_image_no=out_first,
                         setup_fields=fields, trigger_time=(tsec, frac64),
                         first_movie_image=int(ci['firstfr']), total_image_count=int(ci['lastfr'] - ci['firstfr'] + 1),
                         with_times=True, with_exposures=have_times) as w:
             done = 0
             dropped = [0, 0]     # pixels whose low 4 bits were non-zero, pixels converted
+            filled = [0]         # flagged pixels filled in, all frames
             for num, frame, s in self.frames(cine, numbers, fmt, chunk, with_times=have_times):
                 e = None
                 # Without camera stamps: trigger time + number / rate (stated in the description).
@@ -678,16 +688,18 @@ class Camera:
                         e = int(exp_ns * (1 << 32) // 1_000_000_000)
                     else:
                         e = int(s.exptime_us * (1 << 32) // 1_000_000)
-                frame = crop_image(frame, crop)     # the stored rectangle only (P10: codes, cropped as codes)
                 if as_12bit:
-                    dropped[0] += int(np.count_nonzero(frame & 0xF))
-                    dropped[1] += frame.size
-                    frame = frame >> 4
+                    kept = crop_image(frame, crop)
+                    dropped[0] += int(np.count_nonzero(kept & 0xF))
+                    dropped[1] += kept.size
+                frame, n = convert(frame, fmt, as_12bit, fill_flags)   # fill-in sees the whole frame
+                filled[0] += n
+                frame = crop_image(frame, crop)     # the stored rectangle only (P10: codes, cropped as codes)
                 w.append(frame, time=t, exposure=e)
                 done += 1
                 if progress:
                     progress(done, len(numbers))
-        return dropped if as_12bit else None
+        return (dropped if as_12bit else None), filled[0]
 
     def _safe_get(self, name, default=None):
         try:

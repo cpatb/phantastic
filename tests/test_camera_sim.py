@@ -142,6 +142,42 @@ def test_download_as_12bit(sim, cam, tmp_path):
         S.Simulator._img = orig
 
 
+def test_download_fills_camera_flagged_pixels(sim, cam, tmp_path):
+    """A camera that flags pixels with 0xFF00 in P16 (as a real v2512 does): filled by default, kept on request."""
+    import phantastic.simulator as S
+    orig = S.Simulator._img
+    spots = [(3, 5), (10, 40), (20, 63)]          # last one on the right edge (5 neighbours)
+
+    def flagging_img(self, arg):
+        hdr, blob = orig(self, arg)
+        a = np.frombuffer(blob, '<u2').reshape(-1, 32, 64).copy()
+        for r, c in spots:
+            a[:, r, c] = 0xFF00
+        return hdr, a.astype('<u2').tobytes()
+    S.Simulator._img = flagging_img
+    try:
+        recorded(cam, frcount=60, ptframes=10)
+        filled, kept = tmp_path / 'filled.cine', tmp_path / 'kept.cine'
+        info = cam.download(1, filled, first=0, last=3, as_12bit=True)
+        cam.download(1, kept, first=0, last=3, as_12bit=True, fill_flags=False)
+        assert info['flagged_filled'] == 3 * 4
+        rf, rk = CineReader(filled), CineReader(kept)
+        assert 'flags as defective' in rf.setup['Description']
+        want = synthetic_frame(0, 64, 32, seed=1).astype(np.int64)   # the 12-bit truth the flags replaced
+        f0, k0 = rf.read(0).astype(np.int64), rk.read(0)
+        for r, c in spots:
+            assert k0[r, c] == 0xFF0                                  # kept: the flag, as sent (>> 4)
+            nb = [want[r + dy, c + dx] for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+                  if (dy or dx) and 0 <= r + dy < 32 and 0 <= c + dx < 64]
+            assert f0[r, c] == int(np.ceil(np.mean(nb) - 0.5))        # filled: 8-neighbour mean, half down
+        mask = np.zeros((32, 64), bool)
+        for r, c in spots:
+            mask[r, c] = True
+        assert np.array_equal(f0[~mask], want[~mask])                 # nothing else touched
+    finally:
+        S.Simulator._img = orig
+
+
 def test_download_header_rate_fields(cam, tmp_path):
     # without the f64 rate the vendor SDK reports 10 fps (measured on a v2512 download, 2026-10-07)
     recorded(cam, frcount=60, ptframes=10)

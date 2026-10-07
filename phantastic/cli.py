@@ -128,7 +128,7 @@ def cmd_download(a):
     def progress(done, total):
         print(f'\r{done}/{total}', end='', file=sys.stderr)
     kw = dict(first=a.first, last=a.last, step=a.step, fmt=a.format, align=a.align, as_12bit=a.as_12bit,
-              crop=_crop(a))
+              crop=_crop(a), fill_flags=not a.keep_flagged)
     try:
         if a.all:
             info = {'saved': cam.download_all(a.out_dir, a.name, progress=progress, **kw)}
@@ -271,6 +271,9 @@ def main(argv=None):
     p.add_argument('--as-12bit', action='store_true',
                    help="store value >> 4 as 12-bit in PCC's layout (PCC shows 16-bit files white); "
                         'drops any sub-count correction fraction')
+    p.add_argument('--keep-flagged', action='store_true',
+                   help="keep the pixels the camera flags as defective (0xFF00 in P16) instead of PCC's fill-in "
+                        '(mean of the 8 neighbours)')
     p.set_defaults(fn=cmd_download)
     p = sub.add_parser('decimate', help='lossless decimated copy of a cine file')
     p.add_argument('src')

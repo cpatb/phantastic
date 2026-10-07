@@ -438,8 +438,8 @@ class CropWidget(QGroupBox):
         return None
 
 
-def _format_group(session: CameraSession) -> tuple[QGroupBox, QComboBox, QLabel, QCheckBox]:
-    """Wire format combo, its help line and the PCC-compatible 12-bit option (Save Cine, Save All)."""
+def _format_group(session: CameraSession) -> tuple[QGroupBox, QComboBox, QLabel, QCheckBox, QCheckBox]:
+    """Wire format combo, its help line, the PCC-compatible 12-bit option and the flagged-pixel fill-in."""
     combo = QComboBox()
     offered = [f for f in DOWNLOAD_FORMATS if f in session.formats] or ['P16']
     for f in offered:
@@ -452,6 +452,11 @@ def _format_group(session: CameraSession) -> tuple[QGroupBox, QComboBox, QLabel,
                     'loses only the camera\'s correction fraction below one 12-bit count.')
     as12.setEnabled(combo.currentData() in ('P16', 'P16R'))
     as12.setChecked(as12.isEnabled())
+    fill = QCheckBox('Fill pixels the camera flags as defective (as PCC does)')
+    fill.setToolTip('Corrected P16 marks a fixed set of pixels with 0xFF00 in every frame; PCC replaces them with the '
+                    'mean of their 8 neighbours. Untick to keep the flag values. Recorded in the file description.')
+    fill.setEnabled(combo.currentData() == 'P16')
+    fill.setChecked(fill.isEnabled())
 
     def changed():
         fmt = combo.currentData()
@@ -459,13 +464,16 @@ def _format_group(session: CameraSession) -> tuple[QGroupBox, QComboBox, QLabel,
         ok = fmt in ('P16', 'P16R')
         as12.setEnabled(ok)
         as12.setChecked(ok)
+        fill.setEnabled(fmt == 'P16')
+        fill.setChecked(fmt == 'P16')
     combo.currentIndexChanged.connect(changed)
     g = QGroupBox('Wire format')
     v = QVBoxLayout(g)
     v.addWidget(combo)
     v.addWidget(help_)
     v.addWidget(as12)
-    return g, combo, help_, as12
+    v.addWidget(fill)
+    return g, combo, help_, as12, fill
 
 
 TOKEN_HELP = ('File-name tokens (PCC style): {cinenr} {serial} {camname} {date} {time} {count}; a digit sets a '
@@ -495,7 +503,7 @@ class SaveCineDialog(_JobDialog):
                       f'({hi - lo + 1} frames), {res}, {info.get("rate")} fps, trigger = image 0')
         head.setWordWrap(True)
         self.range = RangeWidget(lo, hi, marks)
-        g2, self.fmt_combo, self.fmt_help, self.as12_check = _format_group(session)
+        g2, self.fmt_combo, self.fmt_help, self.as12_check, self.fill_check = _format_group(session)
         self.crop_widget = CropWidget(res.width, res.height, panel) if res is not None else None
         self.path_edit.setText(default_path)
         self.path_edit.setToolTip(TOKEN_HELP)
@@ -567,8 +575,9 @@ class SaveCineDialog(_JobDialog):
         path = self.resolved_path
         as12 = self.as12_check.isChecked()   # unchecked whenever the format does not allow it
         crop = self.crop_widget.crop() if self.crop_widget is not None else None
+        fill = self.fill_check.isChecked()   # unchecked whenever the format is not P16
         return lambda task: download_cine(session, cine, path, first, last, step, align, fmt, task, as_12bit=as12,
-                                          crop=crop)
+                                          crop=crop, fill_flags=fill)
 
     def _summary(self, r: dict) -> str:
         corrected = 'camera-corrected FPN/PRNU' if P.IMAGE_FORMATS[r['fmt']][2] else 'uncorrected'
@@ -600,7 +609,7 @@ class SaveAllDialog(_JobDialog):
         self.template_edit.setToolTip(TOKEN_HELP + ' Without {cinenr}, _Cine<N> is appended (as PCC does).')
         self.preview = QLabel(wordWrap=True)
         self.template_edit.textChanged.connect(self._update_preview)
-        g, self.fmt_combo, self.fmt_help, self.as12_check = _format_group(session)
+        g, self.fmt_combo, self.fmt_help, self.as12_check, self.fill_check = _format_group(session)
         form = QFormLayout()
         form.addRow('Folder', _path_row(self.path_edit, self.browse_btn))
         form.addRow('File name', self.template_edit)
@@ -649,7 +658,8 @@ class SaveAllDialog(_JobDialog):
         session, folder = self.session, self.resolved_path
         template = self.template_edit.text().strip() or DEFAULT_CINE_TEMPLATE
         fmt, as12 = self.fmt_combo.currentData(), self.as12_check.isChecked()
-        return lambda task: download_all(session, folder, template, fmt, task, as_12bit=as12)
+        fill = self.fill_check.isChecked()
+        return lambda task: download_all(session, folder, template, fmt, task, as_12bit=as12, fill_flags=fill)
 
     def _summary(self, res) -> str:
         lines = [f'Saved {len(res)} cine(s) to {self.resolved_path}:']

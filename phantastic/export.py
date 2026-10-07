@@ -33,6 +33,7 @@ import numpy as np
 from .cine import TIME64_SCALE, CineReader
 from .crop import check_crop, crop_dict, crop_image, crop_note
 from .decimate import _indices, select_numbers
+from .defects import convert
 from .naming import DEFAULT_SEQUENCE_PATTERN, expand_name, tokens_in
 
 RAW_PROCESSING = 'none (raw sensor values)'
@@ -145,7 +146,8 @@ class CameraFrames:
     kind = 'camera'
 
     def __init__(self, cam, cine: int, first: int | None = None, last: int | None = None, step: int = 1,
-                 align: str = 'trigger', fmt: str = 'P16', as_12bit: bool = False, chunk: int = 64):
+                 align: str = 'trigger', fmt: str = 'P16', as_12bit: bool = False, chunk: int = 64,
+                 fill_flags: bool = True):
         from . import protocol as P
         from .camera import stamp_time64, year_start
         if as_12bit and fmt not in ('P16', 'P16R'):
@@ -197,6 +199,7 @@ class CameraFrames:
             from .cine import load_linlut10
             self._lut = load_linlut10()
         self.dropped = [0, 0]     # P16 pixels whose low 4 bits were non-zero, pixels converted (as_12bit)
+        self.fill_flags, self.filled = fill_flags and fmt == 'P16', 0   # camera-flagged pixels (defects.py)
         serial = cam._safe_get('info.serial', None)
         self.name = f'cine{cine}_{serial}'
         self.meta = {'source': f'camera {serial} cine {cine} (RAM, not saved)', 'software': 'Phantastic',
@@ -205,6 +208,8 @@ class CameraFrames:
                      'values': ('transmitted value >> 4 (12-bit, PCC file layout)' if as_12bit else
                                 'P10 codes linearised to 12 bit (cine.load_linlut10)' if fmt == 'P10' else
                                 'as transmitted'),
+                     'camera_flagged_pixels': ('replaced by the mean of their 8 neighbours, as PCC does'
+                                               if self.fill_flags else 'as transmitted'),
                      'frame_rate_setup': self.frame_rate, 'camera_cine': {k: str(v) for k, v in ci.items()}}
 
     def __len__(self):
@@ -212,13 +217,15 @@ class CameraFrames:
 
     def images(self, crop=None) -> Iterator[np.ndarray]:
         for _, frame, _ in self.cam.frames(self.cine, self.numbers, self.fmt, self.chunk):
+            if self.as_12bit:
+                kept = crop_image(frame, crop)
+                self.dropped[0] += int(np.count_nonzero(kept & 0xF))
+                self.dropped[1] += kept.size
+            frame, n = convert(frame, self.fmt, self.as_12bit, self.fill_flags)   # same step as Camera.download
+            self.filled += n
             frame = crop_image(frame, crop)
             if self._lut is not None:
                 frame = self._lut[frame]
-            if self.as_12bit:
-                self.dropped[0] += int(np.count_nonzero(frame & 0xF))
-                self.dropped[1] += frame.size
-                frame = frame >> 4
             yield frame
 
     def close(self):

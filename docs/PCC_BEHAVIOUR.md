@@ -94,6 +94,36 @@ What the vendor SDK sends:
   full list is offered, P10 when only P10/P12L are offered. Captures: `tools/vendor_format_probe.py`.
 * Rows arrive top-down (the SDK's image matches the transmitted rows unflipped).
 
+## Measured on a real camera (Phantom v2512, firmware 23070, 2026-10-07)
+
+One recording (cine 1, 256x256, 200 000 fps) was saved twice, by Phantastic (12-bit default) and by
+PCC (Cine Raw), images -670000 .. -660000 (10 001 frames).
+
+* **PCC writes 12-bit files and floors.** On every pixel the camera did not flag, PCC's value equals
+  Phantastic's P16 >> 4 (654 145 408 pixels, 0 differences). P16's low 4 bits on this camera carry
+  the fraction left by the camera's pixel correction (93.6 % of pixels); PCC drops it too.
+* **The camera flags defective pixels; PCC fills them in.** In corrected P16 a fixed set of pixels
+  reads exactly 0xFF00 in every frame: 128 pixels in that window, on a grid (rows 1, 9, ... 121;
+  columns 11, 27, ... 123). No other pixel reached 0xFF00, and uncorrected P16R has none. PCC
+  replaces each with the mean of its 8 neighbours: round-half-down of that mean on the 12-bit
+  values matches PCC exactly on 92.1 % of 25 600 flagged pixels and within 1 count on the rest.
+  Phantastic now does the same by default (`phantastic/defects.py`; `--keep-flagged` / untick to
+  keep the flags). That the flag means "defective" is an inference from these files.
+* **Files open in PCC only as 12-bit.** A 16-bit file (values up to 65 280) shows almost white;
+  the same pixels as 12-bit in PCC's layout display normally. PCC re-saves both bit-identically.
+* **Frame rate is read from a double at SETUP offset 10400** (and an integer at 1516); with those
+  zero, the vendor SDK reports 10 fps. All 145 PCC cines on the lab drive fill both.
+* **Header fields PCC fills:** RealBPP 12, black/white 64/4064, the legacy 16-bit rate, shutter and
+  post-trigger fields, CameraVersion = hardware version, FirmwareVersion = software version,
+  EDRShutterNs, and its display settings (gain 1.021, gamma 1.148 here).
+
+Still open from that comparison:
+* **Per-image exposure.** PCC stores 830.74 ns per frame (exposure setting 1000 ns); Phantastic
+  stored the record's whole-microsecond field (0). The camera sends 12-byte time records, whose
+  extra 4 bytes (kept raw as `exptime32`, `frac32`) evidently carry the sub-microsecond parts.
+* **Per-image times** differ from PCC's by 36-40 ns for the same reason.
+  Settling both needs the raw time records of frames that are also in a PCC file.
+
 ## Not yet established
 
 * **P12L on the wire.** The SDK requests P12L but rejects the simulator's P12L stream: its

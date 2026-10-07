@@ -224,7 +224,8 @@ def _commit_pair(part: Path, dst: Path, sidecar_part: Path, sidecar: Path):
 
 
 def download_cine(session: CameraSession, cine: int, path, first: int, last: int, step: int, align: str,
-                  fmt: str, task: Task, lock_timeout: float = 3.0, as_12bit: bool = False, crop=None) -> dict:
+                  fmt: str, task: Task, lock_timeout: float = 3.0, as_12bit: bool = False, crop=None,
+                  fill_flags: bool = True) -> dict:
     """Download a stored camera cine to ``path`` (the work behind the Save cine dialog).
 
     Writes to ``path + '.part'`` and renames on success, so a cancelled or failed download never
@@ -239,7 +240,7 @@ def download_cine(session: CameraSession, cine: int, path, first: int, last: int
     try:
         with session.use(timeout=lock_timeout) as cam:
             res = cam.download(cine, part, first=first, last=last, step=step, fmt=fmt, align=align,
-                               progress=task.progress, as_12bit=as_12bit, crop=crop)
+                               progress=task.progress, as_12bit=as_12bit, crop=crop, fill_flags=fill_flags)
         os.replace(part, path)
     except BaseException as e:
         e.partial_deleted = _discard([part])   # type: ignore[attr-defined]
@@ -323,11 +324,11 @@ def export_camera(session: CameraSession, cine: int, kind: str, dst, first: int,
 
 
 def download_all(session: CameraSession, folder, template: str, fmt: str, task: Task, as_12bit: bool = False,
-                 lock_timeout: float = 3.0) -> list[dict]:
+                 lock_timeout: float = 3.0, fill_flags: bool = True) -> list[dict]:
     """Save All RAM Cines (PCC p.62): every stored cine to ``folder`` (see :meth:`Camera.download_all`)."""
     task.check_cancelled()
     with session.use(timeout=lock_timeout) as cam:
         res = cam.download_all(folder, template, progress=task.progress, cancelled=task.cancelled.is_set,
-                               fmt=fmt, as_12bit=as_12bit)
+                               fmt=fmt, as_12bit=as_12bit, fill_flags=fill_flags)
         session.trim_transcript()
     return res
