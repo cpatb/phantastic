@@ -45,6 +45,20 @@ Simulated Camera) to try it without a camera. In the Play tab a cine still in ca
 marked with `[` / `]` and saved; Image Tools (Ctrl+I) changes the display only, never the recorded values.
 First time with a camera: [docs/TEST_TODAY.md](docs/TEST_TODAY.md).
 
+Display tools (screen only; recorded values, saved files and the camera are never changed):
+
+* Image Tools: black/white window, Gain, Brightness, Gamma and Toe (`display_curve` in
+  `phantastic/gui/imageview.py` writes out the formula; PCC's own is unpublished, so the numbers mean
+  the same direction as PCC's, not the same pixels), Disable, Default, and Save/Load to a `.phadj` file.
+* Live view at full bit depth (P16) when the camera offers it. The status bar shows raw values; for
+  camera P16 it shows them on the 12-bit scale (value / 16, e.g. `Value: 1234.5 (12-bit)`).
+* Rotate 90° CW/CCW and Flip H/V; X/Y always refer to the stored image (row 0 at the top).
+* Zebra (saturated pixels striped) and Focus Assist (Sobel edges, live only) on the tool strip.
+* Crop tool: a rectangle in stored-image pixels, `panel.crop_rect()` -> `(x, y, w, h)`.
+* Measure: 2-point calibration, distance, angle and speed from the images' own time stamps;
+  Copy or Save CSV.
+* Snapshot: the display as PNG, or the stored frame as a raw 16-bit TIFF.
+
 ![Live tab](docs/screenshot_pcc_live.png)
 
 Command line:
