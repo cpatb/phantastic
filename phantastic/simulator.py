@@ -496,7 +496,9 @@ class Simulator:
             t = cn['trigsecs'] + cn['trigfrac'] * 1e-6 + n / float(cn['rate']) - year0
             csecs = int(t * 100)
             us = int(round((t * 100 - csecs) * 10000)) % 10000
-            out.append(struct.pack('>IHHHH', csecs, min(int(cn['exp']) // 1000, 65535), us << 2, 0, 0))
+            exp = int(cn['exp'])     # like a v2512: whole us + exptime32 in 1/65536 us (frac32: sub-us time, 0 here)
+            out.append(struct.pack('>IHHHH', csecs, min(exp // 1000, 65535), us << 2,
+                                   (exp % 1000) * 65536 // 1000, 0))
         return f'Ok! {{cine: {c}, cnt: {cnt}, size: 12}}', b''.join(out)
 
 

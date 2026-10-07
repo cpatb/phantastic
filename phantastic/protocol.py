@@ -313,8 +313,9 @@ class TimeStamp:
 
     csecs: 1/100 s since the start of the year (camera clock); frac: bits 15..2 = microseconds
     (0..9999) within the centisecond, bit 1 = event (0 = active), bit 0 = lock (0 = locked).
-    exptime: exposure in microseconds (16-bit). exptime32/frac32 are the 32-bit extensions of
-    formats 1 and 3; their exact meaning is not specified beyond that, so they are kept raw.
+    exptime: exposure in microseconds (16-bit). exptime32/frac32 (formats 1 and 3, 12/28-byte records)
+    extend exposure and time below a microsecond in units of 1/65536 us, as measured on a v2512 (see
+    camera.stamp_exposure64 / stamp_time64); they are kept raw here.
     """
     csecs: int
     exptime_us: int

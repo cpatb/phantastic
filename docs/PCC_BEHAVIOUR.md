@@ -117,12 +117,15 @@ PCC (Cine Raw), images -670000 .. -660000 (10 001 frames).
   post-trigger fields, CameraVersion = hardware version, FirmwareVersion = software version,
   EDRShutterNs, and its display settings (gain 1.021, gamma 1.148 here).
 
-Still open from that comparison:
-* **Per-image exposure.** PCC stores 830.74 ns per frame (exposure setting 1000 ns); Phantastic
-  stored the record's whole-microsecond field (0). The camera sends 12-byte time records, whose
-  extra 4 bytes (kept raw as `exptime32`, `frac32`) evidently carry the sub-microsecond parts.
-* **Per-image times** differ from PCC's by 36-40 ns for the same reason.
-  Settling both needs the raw time records of frames that are also in a PCC file.
+* **Per-image exposure is the true exposure, to 1/65536 us.** The camera sends 12-byte time records
+  (`cam.tsformat` 1). At a 1000 ns setting a record held exptime 0 us and exptime32 54445, i.e.
+  54445/65536 us = 830.76 ns; PCC's file stored 3568 / 2^32 s = 830.74 ns = the floor of exactly that.
+  So the camera exposes ~169 ns less than the setting; PCC stores the setting in SETUP (ShutterNs) and
+  the true value per image. Phantastic now does the same (`camera.stamp_exposure64`).
+* **Per-image times include frac32 / 65536 us.** frac32 stayed below 65536, changed by 1 between some
+  5 us frames and drifted 160 ns over 3 s within one recording; PCC's times on an earlier clip sat
+  36-40 ns (drifting) after the whole-microsecond times. Phantastic now adds it (`camera.stamp_time64`).
+  Bit-exact agreement with PCC's times is inferred, not checked (that clip was gone by then).
 
 ## Not yet established
 

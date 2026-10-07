@@ -40,15 +40,38 @@ LIVE_CINE = -1          # img from cine -1 is the live image [spec 5.8]
 LIVE_LOG_EVERY = 200    # session log keeps 1 live frame in 200 (~every 10 s at 20 fps); errors always
 
 
+SUBUS = 65536   # 12/28-byte time records: frac32 and exptime32 count 1/65536 microsecond (measured, below)
+
+
 def stamp_time64(s: P.TimeStamp, year0: int) -> tuple[int, int]:
     """A camera time stamp as cine TIME64 (seconds since 1970, fraction * 2^32).
 
     The stamp counts centiseconds from the start of the trigger's year (``year0``, unix s) plus
-    microseconds in ``frac >> 2`` [spec 5.8].
+    microseconds in ``frac >> 2`` [spec 5.8], plus, in 12/28-byte records, ``frac32`` / 65536 us.
+    That unit is inferred from a v2512 (2026-10-07): frac32 stayed below 65536, changed by 1 between
+    some 5 us frames (clock drift of ~50 ppb) and drifted 160 ns over 3 s, which matches the 36-40 ns
+    drifting offset of PCC's times from whole-microsecond ones on an earlier clip of that camera.
     """
     sec = year0 + s.csecs // 100
     usec = (s.csecs % 100) * 10000 + (s.frac >> 2)
-    return sec, int(usec * (1 << 32) // 1_000_000)
+    sub = s.frac32 or 0
+    return sec, int((usec * SUBUS + sub) * (1 << 32) // (1_000_000 * SUBUS))
+
+
+def stamp_exposure64(s: P.TimeStamp, setting_ns: int | None) -> int:
+    """Per-image exposure as cine tag-1003 units (seconds * 2^32).
+
+    12/28-byte records carry it to 1/65536 us (``exptime_us`` + ``exptime32`` / 65536): a v2512 at a
+    1000 ns setting sent 0 + 54445/65536 us, and PCC's file of that camera stored 3568 = floor of
+    exactly this value (830.74 ns), so this is what PCC stores. Without the extension (8/24-byte
+    records) only whole microseconds exist: then the cine's setting is stored when it agrees with
+    them to within that resolution, else the stamp's own value.
+    """
+    if s.exptime32 is not None:
+        return int((s.exptime_us * SUBUS + s.exptime32) * (1 << 32) // (1_000_000 * SUBUS))
+    if setting_ns and abs(s.exptime_us * 1000 - setting_ns) < 1000:
+        return int(setting_ns * (1 << 32) // 1_000_000_000)
+    return int(s.exptime_us * (1 << 32) // 1_000_000)
 
 
 def year_start(tsec: int) -> int:
@@ -679,15 +702,7 @@ class Camera:
                 t = (t64 >> 32, t64 & 0xFFFFFFFF)
                 if s is not None:
                     t = stamp_time64(s, year0)
-                    # The stamp's exposure is whole microseconds (16-bit). When it agrees with the
-                    # cine's exposure setting (ns) to within that resolution, store the precise
-                    # setting; otherwise (e.g. auto-exposure changed it) keep the stamp's value.
-                    # exptime32/frac32 stay unused until checked on hardware.
-                    exp_ns = int(ci['exp'] or 0)
-                    if exp_ns and abs(s.exptime_us * 1000 - exp_ns) < 1000:
-                        e = int(exp_ns * (1 << 32) // 1_000_000_000)
-                    else:
-                        e = int(s.exptime_us * (1 << 32) // 1_000_000)
+                    e = stamp_exposure64(s, int(ci['exp'] or 0))
                 if as_12bit:
                     kept = crop_image(frame, crop)
                     dropped[0] += int(np.count_nonzero(kept & 0xF))

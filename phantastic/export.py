@@ -149,7 +149,7 @@ class CameraFrames:
                  align: str = 'trigger', fmt: str = 'P16', as_12bit: bool = False, chunk: int = 64,
                  fill_flags: bool = True):
         from . import protocol as P
-        from .camera import stamp_time64, year_start
+        from .camera import stamp_exposure64, stamp_time64, year_start
         if as_12bit and fmt not in ('P16', 'P16R'):
             raise ValueError('as_12bit applies to P16/P16R only')
         if fmt not in P.IMAGE_FORMATS:
@@ -182,12 +182,9 @@ class CameraFrames:
                 for s in stamps:
                     sec, fr = stamp_time64(s, year0)
                     t64.append(((sec - tsec) << 32) + fr - frac64)
-                    # Camera.download's rule: the cine's setting (ns) when the stamp's whole-us value agrees
-                    # with it, else the stamp's own value (e.g. auto-exposure changed it)
-                    e_ns.append(int(exp_ns) if exp_ns and abs(s.exptime_us * 1000 - int(exp_ns)) < 1000
-                                else s.exptime_us * 1000)
+                    e_ns.append(stamp_exposure64(s, int(exp_ns or 0)))   # Camera.download's rule, tag-1003 units
             self.times = np.asarray(t64, np.int64) / TIME64_SCALE
-            self.exposures_s = np.asarray(e_ns, np.float64) * 1e-9
+            self.exposures_s = np.asarray(e_ns, np.float64) / TIME64_SCALE
             self.times_from = 'per-image time stamps (camera)'
         except P.ProtocolError:
             self.times = self.numbers / (self.frame_rate or 1.0)
