@@ -20,6 +20,8 @@ classifiers = [
 gui = ["PySide6>=6.5"]
 test = ["pytest>=7"]
 capture = ["dpkt>=1.9"]
+# MP4 export: imageio-ffmpeg bundles an ffmpeg with libx264; Pillow draws the border data
+video = ["imageio-ffmpeg>=0.4.9", "Pillow>=10.1"]
 
 [project.scripts]
 phantastic = "phantastic.cli:main"
