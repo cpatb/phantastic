@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (QComboBox, QDockWidget, QFileDialog, QLabel, QMai
 from .. import protocol as P
 from ..camera import Camera, discover, network_report
 from ..simulator import Simulator
+from . import image_tools, settings
 from .dialogs import ABOUT_TEXT, ConnectDialog, ExportDialog
 from .icons import icon
 from .image_tools import ImageToolsWindow
@@ -71,8 +72,10 @@ class MainWindow(QMainWindow):
         self.view_mode = 'cursor'
         self._zoom_pending = False
         self.files: list[str] = []
-        self.snapshot_dir = Path(QStandardPaths.writableLocation(
-            QStandardPaths.StandardLocation.PicturesLocation) or Path.home()) / 'Phantastic Snapshots'
+        self.snapshot_dir = Path(settings.get('snapshot_dir') or Path(QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.PicturesLocation) or Path.home()) / 'Phantastic Snapshots')
+        self.save_dir: str | None = settings.get('save_dir')      # last Save Cine folder
+        self.zebra_level: int | None = settings.get('image_tools/zebra_level', None, int) or None
 
         # -- centre: MDI panels
         self.mdi = QMdiArea()
@@ -108,6 +111,8 @@ class MainWindow(QMainWindow):
         self._rate_timer.setInterval(500)
         self._rate_timer.timeout.connect(self._update_rate)
         self._rate_timer.start()
+        geo = settings.get('main/geometry')
+        self.geometry_restored = bool(geo) and self.restoreGeometry(geo)
 
     # ------------------------------------------------------------------ layout
     def _action(self, name: str, tip: str, slot=None, checkable: bool = False, shortcut: str | None = None) -> QAction:
@@ -141,9 +146,12 @@ class MainWindow(QMainWindow):
         # View: Cursor, Pan, Zoom Actual Size, Zoom Fit, Zoom (p.16)
         self.cursor_action = self._action('cursor', 'Cursor', lambda: self.set_view_mode('cursor'), True)
         self.pan_action = self._action('pan', 'Pan', lambda: self.set_view_mode('pan'), True)
+        # Crop (p.46) and Measure (p.84-85) tools: drag a rectangle / click points; display only
+        self.crop_action = self._action('crop', 'Crop rectangle', lambda: self.set_view_mode('crop'), True)
+        self.measure_action = self._action('measure', 'Measure', lambda: self.set_view_mode('measure'), True)
         g = QActionGroup(self)
         g.setExclusive(True)
-        for a in (self.cursor_action, self.pan_action):
+        for a in (self.cursor_action, self.pan_action, self.crop_action, self.measure_action):
             g.addAction(a)
         self.cursor_action.setChecked(True)
         self.zoom11_action = self._action('zoom11', 'Zoom Actual Size', lambda: self.set_zoom(1.0))
@@ -156,7 +164,8 @@ class MainWindow(QMainWindow):
             self.zoom_combo.addItem(text, z)
         self.zoom_combo.activated.connect(lambda i: self.set_zoom(self.zoom_combo.itemData(i)))
         self.zoom_combo.lineEdit().returnPressed.connect(self._zoom_typed)
-        for a in (self.cursor_action, self.pan_action, self.zoom11_action, self.zoomfit_action):
+        for a in (self.cursor_action, self.pan_action, self.crop_action, self.measure_action, self.zoom11_action,
+                  self.zoomfit_action):
             tb.addAction(a)
         tb.addWidget(self.zoom_combo)
         tb.addSeparator()
@@ -165,6 +174,7 @@ class MainWindow(QMainWindow):
         tb.addAction(self.imagetools_action)
         self.snapshot_action = self._action('snapshot', 'Snapshot', self.snapshot, shortcut='Ctrl+N')
         self.snapshot_btn = self._menu_button(self.snapshot_action, (
+            ('Snapshot (display PNG)', self.snapshot), ('Snapshot raw 16-bit TIFF (stored values)', self.snapshot_raw),
             ('Snapshot Folder...', self.choose_snapshot_folder), ('Explore Snapshots', self.explore_snapshots)))
         tb.addWidget(self.snapshot_btn)
         tb.addSeparator()
@@ -190,13 +200,17 @@ class MainWindow(QMainWindow):
             ('Help (README)', self.show_help), ('Open log folder', self.open_log_folder), ('About', self.about)))
         tb.addWidget(self.help_btn)
         tb.addSeparator()
-        # Overlay: CrossHair, Grid (display only, not recorded)
+        # Overlay: CrossHair, Grid, Focus Assist (p.17, p.39), Zebra (p.40); display only, not recorded
         self.cross_action = self._action('crosshair', 'CrossHair', checkable=True)
         self.grid_action = self._action('grid', 'Grid Display', checkable=True)
-        self.cross_action.toggled.connect(self._overlays)
-        self.grid_action.toggled.connect(self._overlays)
-        tb.addAction(self.cross_action)
-        tb.addAction(self.grid_action)
+        self.focus_action = self._action('focus', 'Focus Assist (live images)', checkable=True)
+        self.zebra_action = self._action('zebra', 'Zebra on overexposure', checkable=True)
+        for a, key in ((self.cross_action, 'cross'), (self.grid_action, 'grid'), (self.focus_action, 'focus'),
+                       (self.zebra_action, 'zebra')):
+            a.setChecked(bool(settings.get(f'image_tools/{key}', False, bool)))
+            a.toggled.connect(self._overlays)
+            a.toggled.connect(lambda on, k=key: settings.put(f'image_tools/{k}', on))
+            tb.addAction(a)
 
     def _status_bar(self):
         sb = self.statusBar()
@@ -205,7 +219,8 @@ class MainWindow(QMainWindow):
         self.xy_label.setToolTip('Pixel under the cursor, 1-based like PCC (upper-left pixel = 1, 1). '
                                  'The array index is one less.')
         self.value_label = QLabel('Value:')
-        self.value_label.setToolTip('Value of that pixel as stored in the file or sent by the camera')
+        self.value_label.setToolTip('Value of that pixel as stored in the file or sent by the camera, never the '
+                                    'display value. Camera P16 (12-bit x 16) is shown on the 12-bit scale, value / 16.')
         self.progress = QProgressBar()
         self.progress.setMaximumWidth(140)
         self.progress.setVisible(False)
@@ -271,7 +286,7 @@ class MainWindow(QMainWindow):
             return
         x, y, v = ro
         self.xy_label.setText(f'X: {x + 1} Y: {y + 1}')
-        self.value_label.setText(f'RGB: {",".join(map(str, v))}' if isinstance(v, tuple) else f'Value: {v}')
+        self.value_label.setText(p.readout_text())
 
     def _job_progress(self, done: int, total: int):
         if done < 0:
@@ -298,6 +313,9 @@ class MainWindow(QMainWindow):
         panel.view.set_mode(self.view_mode)
         panel.view.show_cross = self.cross_action.isChecked()
         panel.view.show_grid = self.grid_action.isChecked()
+        panel.set_overlays(zebra=self.zebra_action.isChecked(), focus=self.focus_action.isChecked(),
+                           zebra_level=self.zebra_level)
+        panel.calibration_requested.connect(lambda a, b, p=panel: self._calibrate(p, a, b))
         sub.closed.connect(self._panel_closed)
         self.mdi.addSubWindow(sub)
         sub.resize(640, 480)
@@ -437,43 +455,105 @@ class MainWindow(QMainWindow):
 
     def _overlays(self):
         for sub in self.mdi.subWindowList():
-            v = sub.widget().view
+            panel = sub.widget()
+            v = panel.view
             v.show_cross = self.cross_action.isChecked()
             v.show_grid = self.grid_action.isChecked()
+            panel.set_overlays(zebra=self.zebra_action.isChecked(), focus=self.focus_action.isChecked(),
+                               zebra_level=self.zebra_level)
             v.update()
+
+    def set_zebra_level(self, level: int | None):
+        """Zebra threshold in raw values for every panel; None = each format's saturation level."""
+        self.zebra_level = level
+        settings.put('image_tools/zebra_level', level or 0)
+        self._overlays()
+
+    def _calibrate(self, panel: ImagePanel, a, b):
+        """Two calibration points clicked: ask the real length (PCC 'Calibrate', p.81-82)."""
+        from ..measure import distance_angle
+        ans = image_tools.ask_scale(self, distance_angle(a, b)[0])
+        if ans is None:
+            return
+        try:
+            panel.calibrate(a, b, *ans)
+        except ValueError as e:
+            self.report_error(f'Calibrate: {e}')
+            return
+        self.report(f'Scale: {panel.scale:.6g} px/{panel.unit} (this panel)')
 
     def show_image_tools(self) -> ImageToolsWindow:
         if self.image_tools is None:
-            self.image_tools = ImageToolsWindow(self, self.cross_action, self.grid_action)
+            self.image_tools = ImageToolsWindow(self, self.cross_action, self.grid_action, self.zebra_action,
+                                                self.focus_action, self.crop_action, self.measure_action)
+            self.image_tools.zebra_spin.setValue(self.zebra_level or 0)
+            self.image_tools.zebra_level_changed.connect(self.set_zebra_level)
             geo = self.geometry()
             self.image_tools.move(geo.right() - CONTROL_TAB_WIDTH - self.image_tools.width() - 20, geo.top() + 80)
+            tgeo = settings.get('image_tools/geometry')
+            if tgeo:
+                self.image_tools.restoreGeometry(tgeo)
         self.image_tools.set_panel(self.active_panel)
         self.image_tools.show()
         self.image_tools.raise_()
         return self.image_tools
 
+    def _snapshot_path(self, p: ImagePanel, ext: str) -> Path:
+        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        tag = f'_img{p.shown}' if isinstance(p, PlaybackPanel) else ''
+        safe = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in p.title())
+        return self.snapshot_dir / f'{safe}{tag}_{time.strftime("%Y%m%d_%H%M%S")}{ext}'
+
     def snapshot(self) -> Path | None:
+        """The image as displayed (curve, rotation, flips, zebra/focus) as an 8-bit PNG."""
         p = self.active_panel
         img = None if p is None else p.view.display_image()
         if img is None:
             self.report_error('Snapshot: no image in the active panel')
             return None
-        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
-        tag = ''
-        if isinstance(p, PlaybackPanel):
-            tag = f'_img{p.shown}'
-        safe = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in p.title())
-        path = self.snapshot_dir / f'{safe}{tag}_{time.strftime("%Y%m%d_%H%M%S")}.png'
+        path = self._snapshot_path(p, '.png')
         if not img.save(str(path)):
             self.report_error(f'Snapshot: could not write {path}')
             return None
         self.report(f'Snapshot saved: {path} (8-bit display image, not raw values)')
         return path
 
+    def snapshot_raw(self) -> Path | None:
+        """The frame as stored or sent (no curve, rotation, flip or overlay) as a 16-bit TIFF, values unchanged."""
+        import json
+
+        import numpy as np
+        import tifffile
+        p = self.active_panel
+        f = None if p is None else p.frame
+        if f is None:
+            self.report_error('Snapshot: no image in the active panel')
+            return None
+        if f.dtype.kind not in 'ui' or f.dtype.itemsize > 2 or (f.dtype.kind == 'i' and f.min() < 0):
+            self.report_error(f'Snapshot: {f.dtype} values do not fit a 16-bit TIFF unchanged')
+            return None
+        a = f.astype(np.uint16)                       # 8-bit values are widened, never rescaled
+        if not np.array_equal(a, f):
+            raise AssertionError('raw snapshot changed a value')
+        path = self._snapshot_path(p, '.tif')
+        meta = dict(software='Phantastic', source=p.title(), raw=True, source_dtype=str(f.dtype),
+                    image=p.shown if isinstance(p, PlaybackPanel) else None,
+                    transfer_format=getattr(p, 'fmt', None) or getattr(getattr(p, 'source', None), 'fmt', None),
+                    note='stored-array orientation: row 0 = top, no display processing')
+        try:
+            tifffile.imwrite(path, a, photometric='rgb' if a.ndim == 3 else 'minisblack',
+                             description=json.dumps(meta), metadata=None)
+        except OSError as e:
+            self.report_error(f'Snapshot: could not write {path}: {e}')
+            return None
+        self.report(f'Raw snapshot saved: {path} (stored values, 16-bit, no display processing)')
+        return path
+
     def choose_snapshot_folder(self):
         d = QFileDialog.getExistingDirectory(self, 'Snapshot folder', str(self.snapshot_dir))
         if d:
             self.snapshot_dir = Path(d)
+            settings.put('snapshot_dir', d)
 
     def explore_snapshots(self):
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -505,7 +585,9 @@ class MainWindow(QMainWindow):
         self.tasks.submit(job, done, failed)
 
     def connect_by_ip(self):
-        dlg = ConnectDialog(self)
+        last = settings.get('last_ip')
+        dlg = ConnectDialog(self, **({} if not last else dict(ip=last, port=settings.get('last_port', P.CONTROL_PORT,
+                                                                                          int))))
         if dlg.exec():
             self.connect_to(*dlg.address())
 
@@ -557,6 +639,9 @@ class MainWindow(QMainWindow):
             cam, info, acq, formats, extra = r
             self.session = CameraSession(cam, info, formats, simulated=simulated)
             self.session.extra = extra
+            if not simulated:
+                settings.put('last_ip', ip)
+                settings.put('last_port', int(port))
             item = self.manager_tab.add_camera(str(info.get('name') or info.get('serial')), ip, port)
             item.setToolTip(0, f'{info.get("model", "camera")}, serial {info.get("serial")}, {ip}:{port}')
             self.live_tab.set_session(self.session, acq)
@@ -684,10 +769,11 @@ class MainWindow(QMainWindow):
         marks = (p.mark_in, p.mark_out)
         if p.source.kind == 'camera':
             try:
-                dlg = self.live_tab.make_save_dialog(p.source.cine, marks=marks)
+                dlg = self.live_tab.make_save_dialog(p.source.cine, marks=marks, default_dir=self.save_dir)
             except ValueError as e:
                 self.report_error(str(e))
                 return None
+            dlg.finished_job.connect(lambda r, d=dlg: isinstance(r, dict) and self._remember_save_dir(d))
         else:
             src = p.source
             dlg = ExportDialog(self.tasks, 'cine', src.path, src.first, src.last, marks=marks, parent=self)
@@ -695,6 +781,11 @@ class MainWindow(QMainWindow):
         self._track(dlg).show()
         self._last_dialog = dlg
         return dlg
+
+    def _remember_save_dir(self, dlg):
+        d = str(Path(dlg.path_edit.text().strip()).parent)
+        self.save_dir = d
+        settings.put('save_dir', d)
 
     def _save_requested(self, what: str):
         if what == 'cine':
@@ -754,6 +845,9 @@ class MainWindow(QMainWindow):
         QMessageBox.about(self, 'About Phantastic', ABOUT_TEXT)
 
     def closeEvent(self, event):
+        settings.put('main/geometry', self.saveGeometry())
+        if self.image_tools is not None:
+            settings.put('image_tools/geometry', self.image_tools.saveGeometry())
         self.tasks.cancel_all()
         self.live_tab.timer.stop()
         for sub in self.mdi.subWindowList():

@@ -108,6 +108,35 @@ def _draw(name: str, p: QPainter):
         for v in (10, 22):
             p.drawLine(v, 3, v, 29)
             p.drawLine(3, v, 29, v)
+    elif name == 'focus':
+        p.setPen(QPen(DARK, 1.5))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QRectF(5, 5, 22, 22))
+        p.setPen(QPen(GREEN, 2.5))
+        for (x0, y0), (x1, y1) in (((16, 2), (16, 11)), ((16, 21), (16, 30)), ((2, 16), (11, 16)), ((21, 16), (30, 16))):
+            p.drawLine(x0, y0, x1, y1)
+    elif name == 'zebra':
+        p.setPen(QPen(DARK, 1))
+        p.setBrush(WHITE)
+        p.drawRect(QRectF(4, 4, 24, 24))
+        p.setClipRect(QRectF(4, 4, 24, 24))
+        p.setPen(QPen(RED, 3))
+        for k in (-12, -4, 4, 12):
+            p.drawLine(QPointF(4 + k, 28), QPointF(28 + k, 4))
+        p.setClipping(False)
+    elif name == 'crop':
+        p.setPen(QPen(DARK, 2.5))
+        p.drawLine(9, 3, 9, 23)
+        p.drawLine(9, 23, 29, 23)
+        p.drawLine(3, 9, 23, 9)
+        p.drawLine(23, 9, 23, 29)
+    elif name == 'measure':
+        p.setPen(QPen(QColor(200, 0, 200), 2))
+        p.drawLine(5, 26, 27, 6)
+        p.setPen(QPen(DARK, 2))
+        for x, y in ((5, 26), (27, 6)):
+            p.drawLine(x - 3, y, x + 3, y)
+            p.drawLine(x, y - 3, x, y + 3)
     elif name == 'discover':
         p.setPen(QPen(DARK, 2.5))
         p.setBrush(Qt.BrushStyle.NoBrush)
