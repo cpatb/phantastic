@@ -110,10 +110,12 @@ def decimate_cine(src, dst, step: int, align: str = 'trigger', first: int | None
         if len(idx) == 0:
             raise ValueError('no images selected')
         crop = check_crop(crop, r.width, r.height, r.packing)
-        if crop and r.setup.get('CFA', 0) and not r.is_color and (crop[0] % 2 or crop[1] % 2):
-            # raw colour-sensor data: an odd offset shifts the colour-filter phase that SETUP.CFA describes
-            raise ValueError(f'this is raw colour-sensor data (SETUP.CFA = {r.setup["CFA"]}): the crop x and y '
-                             'must be even, or the colour pattern would no longer match the file\'s CFA field')
+        if crop and r.setup.get('CFA', 0) and not r.is_color and any(v % 2 for v in crop):
+            # Raw colour-sensor data: an odd offset shifts the colour-filter phase that SETUP.CFA describes.
+            # Whether CFA counts from the top row or the first STORED row (the bottom, for 16-bit files) is not
+            # established, so x, y, w and h must all be even: then both edges keep their phase.
+            raise ValueError(f'this is raw colour-sensor data (SETUP.CFA = {r.setup["CFA"]}): crop x, y, w and h '
+                             'must all be even, or the colour pattern would no longer match the file\'s CFA field')
         n_src = len(r)
         times = r.image_times_raw() if r.has_complete_times() else None
         synthesized = times is None

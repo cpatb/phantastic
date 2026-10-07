@@ -70,9 +70,10 @@ def atomic_pair(dst, sidecar) -> Iterator[tuple[Path, Path]]:
         raise
     try:
         os.replace(spart, sidecar)
-    except BaseException:
+    except BaseException as e:
         spart.unlink(missing_ok=True)
         sidecar.unlink(missing_ok=True)
+        e.written_without_sidecar = [str(dst)]       # type: ignore[attr-defined]  (the GUI reports it)
         raise
 
 
@@ -549,17 +550,30 @@ def write_mp4(frames, dst, fps: float = 30.0, black: float | None = None, white:
             proc = subprocess.Popen(cmd + [str(mpart)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err)
         except OSError as e:
             raise RuntimeError(f'cannot run ffmpeg {exe!r}: {e}. {MP4_MISSING}') from e
+        class _PipeDied(Exception):
+            pass
+
+        def feed(data: bytes | None):
+            """Only errors of the ffmpeg pipe itself become an ffmpeg failure; a camera or disk error
+            while reading frames propagates as itself."""
+            try:
+                if data is None:
+                    proc.stdin.close()
+                else:
+                    proc.stdin.write(data)
+            except OSError as e:   # BrokenPipeError; on Windows a dead pipe raises OSError(EINVAL)
+                raise _PipeDied() from e
         try:
             for k in range(n):
                 img8 = first8 if k == 0 else _orient(render(next(it)), rotate, flip_h, flip_v)
                 if img8.shape != first8.shape or img8.dtype != np.uint8:
                     raise ValueError(f'frame {k}: render gave {img8.dtype} {img8.shape}, first was {first8.shape}')
-                proc.stdin.write(_compose(img8, bd, k, size, rgb).tobytes())
+                feed(_compose(img8, bd, k, size, rgb).tobytes())
                 if progress:
                     progress(k + 1, n)
-            proc.stdin.close()
+            feed(None)
             rc = proc.wait()
-        except OSError:       # BrokenPipeError; on Windows a dead pipe raises OSError(EINVAL)
+        except _PipeDied:
             proc.kill()
             rc = proc.wait() or -1
         except BaseException:

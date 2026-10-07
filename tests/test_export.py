@@ -463,8 +463,9 @@ def test_odd_crop_of_raw_colour_sensor_data_is_refused(tmp_path):
     src = tmp_path / 'bayer.cine'
     with CineWriter(src, 8, 6, 1, 'mono16', setup_fields={'FrameRate': 100, 'RealBPP': 12, 'CFA': 3}) as w:
         w.append(np.arange(48, dtype=np.uint16).reshape(6, 8), time=(T0, 0), exposure=1)
-    with pytest.raises(ValueError, match='even'):
-        decimate_cine(src, tmp_path / 'c.cine', 1, crop=(1, 0, 4, 4))
+    for bad in [(1, 0, 4, 4), (0, 1, 4, 4), (0, 0, 3, 4), (0, 0, 4, 3)]:
+        with pytest.raises(ValueError, match='even'):
+            decimate_cine(src, tmp_path / 'c.cine', 1, crop=bad)
     decimate_cine(src, tmp_path / 'c.cine', 1, crop=(2, 2, 4, 4))               # even offsets keep the phase
     with CineReader(tmp_path / 'c.cine') as r:
         assert np.array_equal(r.read(0), np.arange(48).reshape(6, 8)[2:6, 2:6])
@@ -499,8 +500,9 @@ def test_tiff_sidecar_rename_failure_leaves_no_stale_sidecar(tmp_path, monkeypat
     src = make_cine(tmp_path / 's.cine')
     (tmp_path / 't.tif.json').write_text('old sidecar')
     _failing_replace(monkeypatch, 't.tif.json')
-    with pytest.raises(PermissionError):
+    with pytest.raises(PermissionError) as ei:
         export_tiff(src, tmp_path / 't.tif')
+    assert ei.value.written_without_sidecar == [str(tmp_path / 't.tif')]
     assert (tmp_path / 't.tif').exists() and not (tmp_path / 't.tif.json').exists()   # never a mismatched pair
     assert not list(tmp_path.glob('*.part'))
 
@@ -528,6 +530,22 @@ def test_mp4_cancel_leaves_nothing(tmp_path):
             raise KeyboardInterrupt
     with pytest.raises(KeyboardInterrupt):
         export_mp4(src, tmp_path / 'm.mp4', progress=cancel)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ['s.cine']
+
+
+@needs_ffmpeg
+def test_mp4_source_error_is_reported_as_itself(tmp_path):
+    """A read error while frames stream (camera link, disk) must surface as itself, not as an ffmpeg failure."""
+    src = make_cine(tmp_path / 's.cine')
+
+    class Broken(FileFrames):
+        def images(self):
+            it = super().images()
+            yield next(it)
+            raise ConnectionError('data stream closed after 0 of 1386 bytes')
+    with Broken(src) as fr:
+        with pytest.raises(ConnectionError, match='data stream'):
+            write_mp4(fr, tmp_path / 'm.mp4')
     assert sorted(p.name for p in tmp_path.iterdir()) == ['s.cine']
 
 

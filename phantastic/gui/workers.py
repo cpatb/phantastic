@@ -217,8 +217,9 @@ def _commit_pair(part: Path, dst: Path, sidecar_part: Path, sidecar: Path):
     os.replace(part, dst)
     try:
         os.replace(sidecar_part, sidecar)
-    except BaseException:
+    except BaseException as e:
         Path(sidecar).unlink(missing_ok=True)
+        e.written_without_sidecar = [str(dst)]       # type: ignore[attr-defined]
         raise
 
 

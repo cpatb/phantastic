@@ -341,7 +341,10 @@ class _JobDialog(QDialog):
         deleted = getattr(e, 'partial_deleted', [])
         tail = (f'\nPartial file deleted: {", ".join(deleted)}' if deleted else '\nNo partial file was left behind.')
         head = 'Cancelled.' if isinstance(e, Cancelled) else f'Failed. {describe_error(e)}'
-        self.summary.setPlainText(head + tail + f'\nNothing was written to {self.resolved_path or self.output_path()}.')
+        written = getattr(e, 'written_without_sidecar', [])
+        what = (f'\nWRITTEN, but its .json sidecar (image numbers and times) could not be saved: {", ".join(written)}'
+                if written else f'\nNothing was written to {self.resolved_path or self.output_path()}.')
+        self.summary.setPlainText(head + tail + what)
         self.finished_job.emit(e)
 
     def closeEvent(self, event):
