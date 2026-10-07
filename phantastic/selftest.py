@@ -6,6 +6,7 @@ Steps (each reports PASS / WARN / FAIL / SKIP and keeps going where it can):
   1 network     adapters and whether one is on a Phantom subnet
   2 discover    does the camera answer UDP discovery
   3 identity    model, serial, firmware, features, image formats (read only)
+  3b structures defc, cam, auto, video, meta, irig, eth read with 'get' (read only) -> structures.txt
   4 live        one live P16 frame: size, value range, MSB alignment (multiples of 16)
   5 record      ONLY with --record-cine N: record into cine N (erases what it held) and trigger
   6 formats     the same 20 stored frames downloaded in every offered format, each cross-checked
@@ -31,6 +32,7 @@ from .camera import Camera, discover, network_report
 from .cine import load_linlut10
 
 N_FRAMES = 20
+STRUCTURES = ('defc', 'cam', 'auto', 'video', 'meta', 'irig', 'eth')   # read with get only; never 'get *' (64 KB cap)
 
 
 @dataclass
@@ -97,6 +99,17 @@ def run(ip: str, port: int = P.CONTROL_PORT, outdir=None, record_cine: int | Non
         acq = cam.acquisition()
         add(Result('settings', 'PASS', f'res {acq.get("res")}, rate {acq.get("rate")}, exposure {acq.get("exp")} ns, '
                    f'post-trigger {acq.get("ptframes")}', {'defc': {k: str(v) for k, v in acq.items()}}))
+        # read-only dump of the setting structures, so trigger/sync/fan/auto-trigger controls can be
+        # wired to the variable names THIS camera reports (names so far come from a Miro M310 tree)
+        got, lines = [], []
+        for name in STRUCTURES:
+            try:
+                lines.append(f'get {name}\n{cam.command(f"get {name}")}\n')
+                got.append(name)
+            except (P.ProtocolError, OSError) as e:
+                lines.append(f'get {name}\n!! {type(e).__name__}: {e}\n')
+        (out / 'structures.txt').write_text('\n'.join(lines), encoding='utf-8')
+        add(Result('structures', 'PASS' if got else 'WARN', f'read {", ".join(got) or "none"} -> structures.txt'))
         if cancelled():
             return _finish(results, out, say, cam, own)
         # 4 live
