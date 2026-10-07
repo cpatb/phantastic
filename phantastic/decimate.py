@@ -103,12 +103,17 @@ def decimate_cine(src, dst, step: int, align: str = 'trigger', first: int | None
     alone because their meaning is not established. Written to ``dst + '.part'`` and renamed.
     """
     from .crop import check_crop, crop_image, crop_note
-    from .export import atomic_path
+    from .export import atomic_path, check_not_source
+    check_not_source(src, dst)
     with CineReader(src) as r:
         idx = _indices(r, first, last, step, align)
         if len(idx) == 0:
             raise ValueError('no images selected')
         crop = check_crop(crop, r.width, r.height, r.packing)
+        if crop and r.setup.get('CFA', 0) and not r.is_color and (crop[0] % 2 or crop[1] % 2):
+            # raw colour-sensor data: an odd offset shifts the colour-filter phase that SETUP.CFA describes
+            raise ValueError(f'this is raw colour-sensor data (SETUP.CFA = {r.setup["CFA"]}): the crop x and y '
+                             'must be even, or the colour pattern would no longer match the file\'s CFA field')
         n_src = len(r)
         times = r.image_times_raw() if r.has_complete_times() else None
         synthesized = times is None
@@ -198,7 +203,9 @@ def export_tiff(src, dst, first: int | None = None, last: int | None = None, ste
     written, so Fiji shows the interval only via the sidecar. Both are written under temporary
     names and renamed on success (:func:`phantastic.export.write_tiff_stack`).
     """
-    from .export import FileFrames, write_tiff_stack
+    from .export import FileFrames, check_not_source, write_tiff_stack
+    check_not_source(src, dst)
+    check_not_source(src, str(dst) + '.json')
     table, name = load_pcc_table(src, pcc_table) if pcc_table is not None else (None, None)
     with FileFrames(src, first, last, step, align) as fr:
         return write_tiff_stack(fr, dst, crop=crop, table=table, table_name=name, progress=progress)

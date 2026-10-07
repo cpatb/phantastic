@@ -443,3 +443,115 @@ def test_cine_header_records_crop_offset_in_description_only(tmp_path):
         raw = r.setup_raw
     assert struct.unpack_from('<II', raw, 1580) == (0, 0)
     assert struct.unpack_from('<HH', raw, 737) == (3, 3)
+
+
+# ----------------------------------------------------------------------------- failure paths (review 2026-10-07)
+
+def test_output_over_source_is_refused(tmp_path):
+    src = make_cine(tmp_path / 's.cine')
+    before = src.read_bytes()
+    with pytest.raises(ValueError, match='source'):
+        decimate_cine(src, src, 2)
+    with pytest.raises(ValueError, match='source'):
+        export_tiff(src, src)
+    with pytest.raises(ValueError, match='source'):
+        export_mp4(src, src)
+    assert src.read_bytes() == before and sorted(p.name for p in tmp_path.iterdir()) == ['s.cine']
+
+
+def test_odd_crop_of_raw_colour_sensor_data_is_refused(tmp_path):
+    src = tmp_path / 'bayer.cine'
+    with CineWriter(src, 8, 6, 1, 'mono16', setup_fields={'FrameRate': 100, 'RealBPP': 12, 'CFA': 3}) as w:
+        w.append(np.arange(48, dtype=np.uint16).reshape(6, 8), time=(T0, 0), exposure=1)
+    with pytest.raises(ValueError, match='even'):
+        decimate_cine(src, tmp_path / 'c.cine', 1, crop=(1, 0, 4, 4))
+    decimate_cine(src, tmp_path / 'c.cine', 1, crop=(2, 2, 4, 4))               # even offsets keep the phase
+    with CineReader(tmp_path / 'c.cine') as r:
+        assert np.array_equal(r.read(0), np.arange(48).reshape(6, 8)[2:6, 2:6])
+
+
+def _failing_replace(monkeypatch, name):
+    import os as _os
+    real = _os.replace
+
+    def replace(a, b):
+        if str(b).endswith(name):
+            raise PermissionError(f'{b} is open in another program')
+        return real(a, b)
+    monkeypatch.setattr('phantastic.export.os.replace', replace)
+
+
+@needs_ffmpeg
+def test_mp4_locked_target_keeps_the_old_pair(tmp_path, monkeypatch):
+    """Re-exporting over a movie that a player holds open: the old movie and its sidecar stay a pair."""
+    src = make_cine(tmp_path / 's.cine')
+    (tmp_path / 'm.mp4').write_bytes(b'old movie')
+    (tmp_path / 'm.mp4.json').write_text('old sidecar')
+    _failing_replace(monkeypatch, 'm.mp4')
+    with pytest.raises(PermissionError):
+        export_mp4(src, tmp_path / 'm.mp4')
+    assert (tmp_path / 'm.mp4').read_bytes() == b'old movie'
+    assert (tmp_path / 'm.mp4.json').read_text() == 'old sidecar'
+    assert not list(tmp_path.glob('*.part'))
+
+
+def test_tiff_sidecar_rename_failure_leaves_no_stale_sidecar(tmp_path, monkeypatch):
+    src = make_cine(tmp_path / 's.cine')
+    (tmp_path / 't.tif.json').write_text('old sidecar')
+    _failing_replace(monkeypatch, 't.tif.json')
+    with pytest.raises(PermissionError):
+        export_tiff(src, tmp_path / 't.tif')
+    assert (tmp_path / 't.tif').exists() and not (tmp_path / 't.tif.json').exists()   # never a mismatched pair
+    assert not list(tmp_path.glob('*.part'))
+
+
+def test_tiff_sequence_failed_move_leaves_no_mixture(tmp_path, monkeypatch):
+    src = make_cine(tmp_path / 'shot.cine')
+    out = tmp_path / 'seq'
+    export_tiff_sequence(src, out)                                   # an old, complete set
+    _failing_replace(monkeypatch, 'shot_000001.tif')                 # the 5th of 6 moves fails
+    with pytest.raises(PermissionError):
+        export_tiff_sequence(src, out, crop=(0, 0, 4, 4), overwrite=True)
+    left = sorted(p.name for p in out.iterdir())
+    assert 'shot_sequence.json' not in left                          # nothing claims the set is complete
+    assert not any('INCOMPLETE' in n for n in left)
+    for n in left:                                                   # what is left is old, never new
+        assert tifffile.imread(out / n).shape == (H, W)
+
+
+@needs_ffmpeg
+def test_mp4_cancel_leaves_nothing(tmp_path):
+    src = make_cine(tmp_path / 's.cine')
+
+    def cancel(done, total):
+        if done == 2:
+            raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        export_mp4(src, tmp_path / 'm.mp4', progress=cancel)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ['s.cine']
+
+
+def test_border_time_text_resolves_every_frame():
+    """1 Mfps over 20 ms: ms unit, and still one distinct time per image."""
+    from phantastic.export import _Border
+    t = np.arange(-10000, 10001, 500) * 1e-6
+    t[-1] = t[-2] + 1e-6                                              # two images 1 µs apart
+
+    class Frames:
+        numbers, times, exposures_s, frame_rate = np.arange(len(t)), t, np.full(len(t), 5e-7), 1e6
+
+        def __len__(self):
+            return len(t)
+    b = _Border(Frames(), 64)
+    texts = [b.lines(k)[1] for k in range(len(t))]
+    assert b.unit == 'ms' and len(set(texts)) == len(t)
+    assert texts[-1] == '+9.5010 ms from trigger'
+
+
+def test_camera_times_and_exposures_match_download(cam, tmp_path):
+    """Bit-for-bit: the export's times are the downloaded file's times (same TIME64 arithmetic)."""
+    record(cam)
+    cam.download(1, tmp_path / 'd.cine', first=-7, last=6, fmt='P16', as_12bit=True)
+    with CameraFrames(cam, 1, first=-7, last=6, fmt='P16', as_12bit=True) as fr, CineReader(tmp_path / 'd.cine') as r:
+        assert np.array_equal(fr.times, r.relative_times())
+        assert np.allclose(fr.exposures_s, r.exposures_raw() / 2 ** 32, rtol=0, atol=1e-9)

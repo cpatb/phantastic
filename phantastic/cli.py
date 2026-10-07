@@ -137,7 +137,16 @@ def cmd_download(a):
             if '{' in out:          # file-name tokens (phantastic.naming); never overwrite a file
                 from .naming import expand_name, unique_path
                 out = str(unique_path(expand_name(out, **cam.name_fields(a.cine))))
-            info = cam.download(a.cine, out, progress=progress, **kw)
+            part = out + '.part'           # renamed only when complete (never a truncated .cine)
+            try:
+                info = cam.download(a.cine, part, progress=progress, **kw)
+                import os
+                os.replace(part, out)
+            except BaseException:
+                import pathlib
+                pathlib.Path(part).unlink(missing_ok=True)
+                raise
+            info['path'] = out
     finally:
         cam.close()
     print(file=sys.stderr)

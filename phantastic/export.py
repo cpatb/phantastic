@@ -47,10 +47,39 @@ def atomic_path(dst) -> Iterator[Path]:
     part = dst.with_name(dst.name + '.part')
     try:
         yield part
+        os.replace(part, dst)
     except BaseException:
         part.unlink(missing_ok=True)
         raise
-    os.replace(part, dst)
+
+
+@contextmanager
+def atomic_pair(dst, sidecar) -> Iterator[tuple[Path, Path]]:
+    """Yield (``dst.part``, ``sidecar.part``). On success the MAIN file is renamed first, then the sidecar;
+    if the main rename fails (e.g. the old file is open in a player) both parts are deleted and the old
+    pair is untouched; if only the sidecar rename fails, the old sidecar is deleted too, so no sidecar
+    ever sits beside a file it does not describe."""
+    dst, sidecar = Path(dst), Path(sidecar)
+    part, spart = dst.with_name(dst.name + '.part'), sidecar.with_name(sidecar.name + '.part')
+    try:
+        yield part, spart
+        os.replace(part, dst)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        spart.unlink(missing_ok=True)
+        raise
+    try:
+        os.replace(spart, sidecar)
+    except BaseException:
+        spart.unlink(missing_ok=True)
+        sidecar.unlink(missing_ok=True)
+        raise
+
+
+def check_not_source(src, dst):
+    """Refuse an output that is the source file itself (never modify sources)."""
+    if Path(dst).resolve() == Path(src).resolve():
+        raise ValueError(f'refusing to write over the source file {src}; choose another output path')
 
 
 # ----------------------------------------------------------------------------- sources
@@ -139,19 +168,27 @@ class CameraFrames:
         tsec, tfrac_us = int(trig.get('secs', 0)), int(trig.get('frac', 0))
         self.trigger_time = tsec + tfrac_us * 1e-6 if tsec else None
         frac64, year0 = int(tfrac_us * (1 << 32) // 1_000_000), year_start(tsec)
+        exp_ns = ci.get('exp')
+        self.exposures_s = None if exp_ns is None else np.full(len(self.numbers), int(exp_ns) * 1e-9)
         try:     # same TIME64 arithmetic as Camera.download, relative to the trigger in integer units
-            t64 = []
+            t64, e_ns = [], []
             for start, n in cam.runs(self.numbers, chunk):
-                for s in cam.read_time_stamps(cine, start, n):
+                stamps = cam.read_time_stamps(cine, start, n)
+                if len(stamps) != n:
+                    raise ValueError(f'camera returned {len(stamps)} time stamps for {n} images from {start}')
+                for s in stamps:
                     sec, fr = stamp_time64(s, year0)
                     t64.append(((sec - tsec) << 32) + fr - frac64)
+                    # Camera.download's rule: the cine's setting (ns) when the stamp's whole-us value agrees
+                    # with it, else the stamp's own value (e.g. auto-exposure changed it)
+                    e_ns.append(int(exp_ns) if exp_ns and abs(s.exptime_us * 1000 - int(exp_ns)) < 1000
+                                else s.exptime_us * 1000)
             self.times = np.asarray(t64, np.int64) / TIME64_SCALE
+            self.exposures_s = np.asarray(e_ns, np.float64) * 1e-9
             self.times_from = 'per-image time stamps (camera)'
         except P.ProtocolError:
             self.times = self.numbers / (self.frame_rate or 1.0)
             self.times_from = 'SYNTHESIZED from image number / frame rate (camera gave no time stamps)'
-        exp_ns = ci.get('exp')
-        self.exposures_s = None if exp_ns is None else np.full(len(self.numbers), int(exp_ns) * 1e-9)
         bits = P.IMAGE_FORMATS[fmt][1]
         self.real_bpp = 12 if (as_12bit or fmt in ('P10', 'P12L')) else bits
         self._lut = None
@@ -244,9 +281,7 @@ def write_tiff_stack(frames, dst, crop=None, table: np.ndarray | None = None, ta
     big = w * h * 2 * n * (3 if frames.meta.get('packing', '').startswith('bgr') else 1) > 3.9e9
     finterval = _finterval(frames)
     dst = Path(dst)
-    with ExitStack() as stack:
-        tpart = stack.enter_context(atomic_path(dst))
-        spart = stack.enter_context(atomic_path(Path(str(dst) + '.json')))   # renamed first, on success
+    with atomic_pair(dst, Path(str(dst) + '.json')) as (tpart, spart):
         with tifffile.TiffWriter(tpart, bigtiff=big) as tw:
             for k, img in enumerate(_cropped_images(frames, crop)):
                 if table is not None:
@@ -294,8 +329,9 @@ def write_tiff_sequence(frames, out_dir, pattern: str = DEFAULT_SEQUENCE_PATTERN
         raise FileExistsError(f'{len(clash)} file(s) already exist, e.g. {clash[0]}; nothing was written')
     meta = _base_meta(frames, crop, RAW_PROCESSING if table is None else f'PCC export table {table_name}')
     meta['files'] = names
-    tmp = out_dir / f'.phantastic-part-{uuid.uuid4().hex[:12]}'
+    tmp = out_dir / f'phantastic-INCOMPLETE-{uuid.uuid4().hex[:12]}.part'     # visible, and says what it is
     tmp.mkdir()
+    moved: list[Path] = []
     try:
         for k, img in enumerate(_cropped_images(frames, crop)):
             if table is not None:
@@ -308,8 +344,21 @@ def write_tiff_sequence(frames, out_dir, pattern: str = DEFAULT_SEQUENCE_PATTERN
             if progress:
                 progress(k + 1, len(names))
         (tmp / sidecar.name).write_text(json.dumps(dict(meta, finterval_s=_finterval(frames)), indent=1))
+        if not overwrite:
+            clash = [p for p in [out_dir / n for n in names] + [sidecar] if p.exists()]
+            if clash:
+                raise FileExistsError(f'{len(clash)} file(s) appeared during the export, e.g. {clash[0]}; '
+                                      'nothing was written')
+        # The sidecar is the record that the set is complete: drop an old one first, move it in last; if a
+        # move fails, the files moved so far are removed again, so no old/new mixture is left described.
+        sidecar.unlink(missing_ok=True)
         for n in names + [sidecar.name]:
             os.replace(tmp / n, out_dir / n)
+            moved.append(out_dir / n)
+    except BaseException:
+        for q in moved:
+            q.unlink(missing_ok=True)
+        raise
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return _extra(frames, dict(dst=str(out_dir), files=names, count=len(names), sidecar=str(sidecar), first=first,
@@ -396,9 +445,16 @@ class _Border:
         self.font_px = max(BORDER_FONT_PX_MIN, img_w // 40)
         self.font = ImageFont.load_default(size=self.font_px)
         self.unit, self.scale = _time_unit(frames.times)
+        # enough decimals that neighbouring images never show the same time (frame interval in the unit)
+        dt = float(np.min(np.abs(np.diff(frames.times)))) if len(frames) > 1 else 0.0
+        # (1e-6 tolerance: a 1 us step read back as 0.99999999 us must not cost an extra digit)
+        self.decimals = 3 if dt <= 0 else max(3, int(np.ceil(-np.log10(dt * self.scale) - 1e-6)) + 1)
         self.line_h = self.font_px + 3
-        ends = [0, len(frames) - 1]    # numbers and times are monotonic: the longest text is at an end
-        widest = max(self.font.getlength(line) for k in ends for line in self.lines(k))
+        # numbers and times are monotonic, so their longest text is at an end; exposures can vary per image
+        cand = {0, len(frames) - 1}
+        if frames.exposures_s is not None:
+            cand.add(int(np.argmax([len(f'{e * 1e6:.3f}') for e in frames.exposures_s])))
+        widest = max(self.font.getlength(line) for k in cand for line in self.lines(k))
         self.width = max(img_w, int(np.ceil(widest)) + 2 * BORDER_MARGIN_PX + self.font_px)
         self.height = 3 * self.line_h + 2 * BORDER_MARGIN_PX
 
@@ -406,7 +462,7 @@ class _Border:
         f = self.frames
         exp = '' if f.exposures_s is None else f'   exposure {f.exposures_s[k] * 1e6:.3f} us'
         return [f'Image {int(f.numbers[k])}',
-                f'{f.times[k] * self.scale:+.3f} {self.unit} from trigger',
+                f'{f.times[k] * self.scale:+.{self.decimals}f} {self.unit} from trigger',
                 f'{f.frame_rate:g} fps{exp}']
 
     def strip(self, k: int) -> np.ndarray:
@@ -487,8 +543,7 @@ def write_mp4(frames, dst, fps: float = 30.0, black: float | None = None, white:
            '-movflags', '+faststart', '-metadata', f'comment={comment}', '-metadata', f'description={comment}',
            '-f', 'mp4']
     with ExitStack() as stack:
-        mpart = stack.enter_context(atomic_path(dst))
-        spart = stack.enter_context(atomic_path(Path(str(dst) + '.json')))
+        mpart, spart = stack.enter_context(atomic_pair(dst, Path(str(dst) + '.json')))
         err = stack.enter_context(tempfile.TemporaryFile())
         try:
             proc = subprocess.Popen(cmd + [str(mpart)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err)
@@ -504,9 +559,9 @@ def write_mp4(frames, dst, fps: float = 30.0, black: float | None = None, white:
                     progress(k + 1, n)
             proc.stdin.close()
             rc = proc.wait()
-        except BrokenPipeError:
-            rc = proc.wait()
-            rc = rc or -1
+        except OSError:       # BrokenPipeError; on Windows a dead pipe raises OSError(EINVAL)
+            proc.kill()
+            rc = proc.wait() or -1
         except BaseException:
             proc.kill()
             proc.wait()
@@ -527,6 +582,7 @@ def export_tiff_sequence(src, out_dir, first: int | None = None, last: int | Non
                          overwrite: bool = False, progress=None) -> dict:
     """A cine file -> one TIFF per selected image (see :func:`write_tiff_sequence`)."""
     from .decimate import load_pcc_table
+    check_not_source(src, out_dir)
     table, name = load_pcc_table(src, pcc_table) if pcc_table is not None else (None, None)
     with FileFrames(src, first, last, step, align) as fr:
         return write_tiff_sequence(fr, out_dir, pattern, crop=crop, table=table, table_name=name,
@@ -536,6 +592,8 @@ def export_tiff_sequence(src, out_dir, first: int | None = None, last: int | Non
 def export_mp4(src, dst, first: int | None = None, last: int | None = None, step: int = 1, align: str = 'trigger',
                progress=None, **opts) -> dict:
     """A cine file -> MP4 display render (see :func:`write_mp4` for ``opts``)."""
+    check_not_source(src, dst)
+    check_not_source(src, str(dst) + '.json')
     with FileFrames(src, first, last, step, align) as fr:
         return write_mp4(fr, dst, progress=progress, **opts)
 

@@ -211,6 +211,17 @@ def _discard(paths: list[Path]) -> list[str]:
     return gone
 
 
+def _commit_pair(part: Path, dst: Path, sidecar_part: Path, sidecar: Path):
+    """Rename the main file first, then its sidecar; if the sidecar rename fails, the old sidecar
+    is removed so it never sits beside a file it does not describe."""
+    os.replace(part, dst)
+    try:
+        os.replace(sidecar_part, sidecar)
+    except BaseException:
+        Path(sidecar).unlink(missing_ok=True)
+        raise
+
+
 def download_cine(session: CameraSession, cine: int, path, first: int, last: int, step: int, align: str,
                   fmt: str, task: Task, lock_timeout: float = 3.0, as_12bit: bool = False, crop=None) -> dict:
     """Download a stored camera cine to ``path`` (the work behind the Save cine dialog).
@@ -265,12 +276,13 @@ def export_file(kind: str, src, dst, first: int, last: int, step: int, align: st
             res = export_tiff(src, part, first=first, last=last, step=step, align=align, progress=task.progress,
                               pcc_table=pcc_table, crop=crop)
             res['pcc_table'] = pcc_table
-            os.replace(sidecar_part, sidecar)
+            _commit_pair(part, dst, sidecar_part, sidecar)
             res['dst'] = str(dst)
             res['sidecar'] = str(sidecar)
         else:
             raise ValueError(kind)
-        os.replace(part, dst)
+        if kind == 'cine':
+            os.replace(part, dst)
     except BaseException as e:
         e.partial_deleted = _discard([part, sidecar_part])   # type: ignore[attr-defined]
         raise
@@ -291,8 +303,7 @@ def export_camera(session: CameraSession, cine: int, kind: str, dst, first: int,
             part, sidecar_part = part_path(dst), Path(str(part_path(dst)) + '.json')
             try:
                 res = write_tiff_stack(fr, part, crop=crop, progress=task.progress)
-                os.replace(sidecar_part, str(dst) + '.json')
-                os.replace(part, dst)
+                _commit_pair(part, dst, sidecar_part, Path(str(dst) + '.json'))
             except BaseException as e:
                 e.partial_deleted = _discard([part, sidecar_part])   # type: ignore[attr-defined]
                 raise
