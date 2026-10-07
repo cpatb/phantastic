@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phantastic"
+version = "0.1.0"
+description = "Open-source control, acquisition and raw data tools for Phantom high-speed cameras"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.23", "tifffile>=2023.1"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.5"]
+test = ["pytest>=7"]
+capture = ["dpkt>=1.9"]
+
+[project.scripts]
+phantastic = "phantastic.cli:main"
+
+[project.gui-scripts]
+phantastic-gui = "phantastic.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["phantastic*"]
+
+[tool.setuptools.package-data]
+phantastic = ["linlut10.txt", "data/*.txt"]

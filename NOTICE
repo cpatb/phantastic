@@ -1,0 +1,13 @@
+Phantastic
+Copyright (c) 2026 The Phantastic contributors. Licensed under the MIT License (see LICENSE).
+
+This product includes data derived from DiamondLightSource/miroCamera
+(https://github.com/DiamondLightSource/miroCamera), licensed under the Apache License,
+Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0):
+
+  phantastic/data/miro_m310_tree.txt  - a Phantom Miro M310 parameter tree taken from the
+                                        camera transcript miroTelnet2.log in that repository,
+                                        reformatted to one structure per line.
+
+"Phantom" is a trademark of Vision Research / AMETEK. Phantastic is not affiliated with,
+endorsed by or supported by them.

@@ -1,0 +1,36 @@
+{
+ "settings": {
+  "BlackLevel": 64,
+  "WhiteLevel": 4064,
+  "fOffset": 0.0,
+  "fGain": 1.0,
+  "fGamma": 1.1721949577331543,
+  "fGammaR": 0.0,
+  "fGammaB": 0.0,
+  "fFlare": 0.0,
+  "fSaturation": 1.0,
+  "fHue": 0.0,
+  "fChroma": 1.0,
+  "ToneLabel": "ExpIndex400000",
+  "TonePoints": 6,
+  "fTone": [
+   0.024000000208616257,
+   0.10000000149011612,
+   0.0560000017285347,
+   0.20000000298023224,
+   0.1340000033378601,
+   0.4000000059604645,
+   0.2240000069141388,
+   0.6000000238418579,
+   0.2709999978542328,
+   0.699999988079071,
+   0.6000000238418579,
+   0.9599999785423279
+  ],
+  "fGain16_8": 1.0,
+  "RealBPP": 12
+ },
+ "kind": "tif16",
+ "derived_from": "800nm_si_sphere_01OCT26\\calibration\\01OCT26 calibration.cine",
+ "checked_against_pcc": "vendor SDK export only (no PCC 16-bit export available to compare)"
+}
