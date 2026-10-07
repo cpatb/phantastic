@@ -30,12 +30,30 @@ import numpy as np
 
 from . import protocol as P
 from .cine import CineWriter
+from .crop import check_crop, crop_image, crop_note
 
 log = logging.getLogger(__name__)
 
 PCC_BLACK_12, PCC_WHITE_12 = 64, 4064   # what PCC writes for a 12-bit v2512 cine
 LIVE_CINE = -1          # img from cine -1 is the live image [spec 5.8]
 LIVE_LOG_EVERY = 200    # session log keeps 1 live frame in 200 (~every 10 s at 20 fps); errors always
+
+
+def stamp_time64(s: P.TimeStamp, year0: int) -> tuple[int, int]:
+    """A camera time stamp as cine TIME64 (seconds since 1970, fraction * 2^32).
+
+    The stamp counts centiseconds from the start of the trigger's year (``year0``, unix s) plus
+    microseconds in ``frac >> 2`` [spec 5.8].
+    """
+    sec = year0 + s.csecs // 100
+    usec = (s.csecs % 100) * 10000 + (s.frac >> 2)
+    return sec, int(usec * (1 << 32) // 1_000_000)
+
+
+def year_start(tsec: int) -> int:
+    """Unix seconds of 1 January (UTC) of the year holding ``tsec`` (0 when no trigger time)."""
+    return int(_dt.datetime(_dt.datetime.fromtimestamp(tsec, _dt.timezone.utc).year, 1, 1,
+                            tzinfo=_dt.timezone.utc).timestamp()) if tsec else 0
 
 
 @dataclass
@@ -477,7 +495,7 @@ class Camera:
     def download(self, cine: int, path, first: int | None = None, last: int | None = None, step: int = 1,
                  fmt: str = 'P16', align: str = 'trigger', chunk: int = 64,
                  progress: Callable[[int, int], None] | None = None, description: str = '',
-                 as_12bit: bool = False) -> dict:
+                 as_12bit: bool = False, crop=None) -> dict:
         """Download a stored cine (or a decimated range of it) into a new .cine file, losslessly.
 
         ``as_12bit`` (P16/P16R only): store value >> 4 as 12-bit data, the layout of PCC's own files
@@ -488,6 +506,9 @@ class Camera:
 
         ``step``/``align`` choose the kept image numbers explicitly: 'trigger' keeps numbers that
         are multiples of ``step`` (PCC's rule, measured), 'first' keeps first, first+step, ...
+        ``crop`` = (x, y, w, h) in top-down image coordinates (see :mod:`phantastic.crop`): only that
+        rectangle is stored, values unchanged; the file's ImWidth/ImHeight are the crop, ImWidthAcq/
+        ImHeightAcq stay the recorded size, and the Description says where the crop came from.
         Returns a summary dict (what was requested, what the camera reported, kept numbers).
         """
         from .decimate import renumbering, select_numbers
@@ -500,19 +521,20 @@ class Camera:
         if len(numbers) == 0:
             raise ValueError(f'no images in [{lo}, {hi}] with step {step}')
         res = ci['res']
+        packing = {'8': 'mono8', '8R': 'mono8', 'P16': 'mono16', 'P16R': 'mono16',
+                   'P10': 'packed10', 'P12L': 'packed12L'}[fmt]
+        crop = check_crop(crop, res.width, res.height, packing)
+        out_w, out_h = (crop[2], crop[3]) if crop else (res.width, res.height)
         try:
             self.read_time_stamps(cine, int(numbers[0]), 1)
             have_times = True
         except P.ProtocolError as e:
             log.warning('time stamps unavailable: %s; writing number/rate times instead', e)
             have_times = False
-        packing = {'8': 'mono8', '8R': 'mono8', 'P16': 'mono16', 'P16R': 'mono16',
-                   'P10': 'packed10', 'P12L': 'packed12L'}[fmt]
         trig = ci.get('trigtime') or {}
         tsec = int(trig.get('secs', 0)) if isinstance(trig, dict) else 0
         tfrac_us = int(trig.get('frac', 0)) if isinstance(trig, dict) else 0
-        year0 = int(_dt.datetime(_dt.datetime.fromtimestamp(tsec, _dt.timezone.utc).year, 1, 1,
-                                 tzinfo=_dt.timezone.utc).timestamp()) if tsec else 0
+        year0 = year_start(tsec)
         bits = P.IMAGE_FORMATS[fmt][1]
         if as_12bit and fmt not in ('P16', 'P16R'):
             raise ValueError('as_12bit applies to P16/P16R only')
@@ -533,7 +555,7 @@ class Camera:
             black, white = PCC_BLACK_12 * 16, PCC_WHITE_12 * 16
         else:
             black, white = 0, (1 << bits) - 1
-        fields = dict(FrameRate=rate_i, FrameRateInt1516=rate_i, FrameRateDouble=float(ci['rate'] or 0), ShutterNs=exp_ns, PostTrigger=pt, ImWidth=res.width, ImHeight=res.height,
+        fields = dict(FrameRate=rate_i, FrameRateInt1516=rate_i, FrameRateDouble=float(ci['rate'] or 0), ShutterNs=exp_ns, PostTrigger=pt, ImWidth=out_w, ImHeight=out_h,
                       # legacy 16-bit copies: with FrameRate16 = 0 the vendor reader reports 10 fps
                       # (measured 2026-10-07); PCC writes min(value, 65535) and whole microseconds
                       FrameRate16=min(rate_i, 0xFFFF), PostTrigger16=min(pt, 0xFFFF),
@@ -548,22 +570,92 @@ class Camera:
         if not have_times:
             fields['Description'] += ' Time stamps SYNTHESIZED from image number / frame rate (camera gave none).'
 
+        if crop:
+            # ImPosXAcq/ImPosYAcq are NOT used for the offset: their meaning is not established (all 143
+            # PCC cines on the lab drive, 2026-10-07, hold 0 there although recorded below full sensor size).
+            fields['Description'] += ' ' + crop_note(crop, res.width, res.height)
         out_first, offset = renumbering(numbers, step) if step > 1 else (int(numbers[0]), 0)
         if step > 1:
             fields['Description'] += f' Image k = camera image k*{step}+{offset} (a cine numbers images consecutively).'
         try:
-            dropped = self._write_download(path, res, numbers, packing, out_first, fields, tsec, frac64, ci,
-                                           have_times, cine, fmt, chunk, year0, as_12bit, progress)
+            dropped = self._write_download(path, (out_w, out_h), numbers, packing, out_first, fields, tsec, frac64,
+                                           ci, have_times, cine, fmt, chunk, year0, as_12bit, progress, crop)
         except BaseException:
             Path(path).unlink(missing_ok=True)      # never leave a partial file that looks complete
             raise
         return dict(cine=cine, path=str(path), fmt=fmt, first=int(numbers[0]), last=int(numbers[-1]),
                     count=len(numbers), step=step, align=align, offset=offset, first_out=out_first,
-                    camera=ci, times=have_times, as_12bit=as_12bit, dropped_low_bits=dropped)
+                    camera=ci, times=have_times, as_12bit=as_12bit, dropped_low_bits=dropped, crop=crop,
+                    width=out_w, height=out_h)
 
-    def _write_download(self, path, res, numbers, packing, out_first, fields, tsec, frac64, ci, have_times,
-                        cine, fmt, chunk, year0, as_12bit, progress):
-        with CineWriter(path, res.width, res.height, len(numbers), packing, first_image_no=out_first,
+    def stored_cines(self) -> list[int]:
+        """Cine numbers whose state holds STR (a stored recording), from ``cstats``."""
+        out = []
+        for key, flags in self.cine_states().items():
+            if key.startswith('c') and key[1:].isdigit() and int(key[1:]) > 0 and isinstance(flags, P.Flags) \
+                    and 'STR' in flags:
+                out.append(int(key[1:]))
+        return sorted(out)
+
+    def name_fields(self, cine: int, info: dict | None = None) -> dict:
+        """Values for the file-name tokens of :mod:`phantastic.naming` (serial, camera name, cine
+        number, trigger date/time)."""
+        from .naming import cine_fields
+        ci = info if info is not None else self.cine_info(cine)
+        trig = ci.get('trigtime') if isinstance(ci.get('trigtime'), dict) else {}
+        return cine_fields(cine, self._safe_get('info.serial', None), self._safe_get('info.name', None),
+                           int(trig.get('secs', 0)) or None)
+
+    def download_all(self, folder, template: str | None = None, progress=None, cancelled=None, **kw) -> list[dict]:
+        """Save All RAM Cines (PCC manual p.62): every stored cine, full range, to ``folder``.
+
+        Names come from ``template`` (tokens of :mod:`phantastic.naming`, default ``cine{cinenr}_{serial}``);
+        a template without {cinenr} gets ``_Cine{cinenr}`` appended, as PCC appends the cine number.
+        An existing file is never replaced: the name gets ``_1``, ``_2``, ... Each file is written as
+        ``.part`` and renamed when complete. ``kw`` goes to :meth:`download` (fmt, as_12bit, step, ...).
+        ``progress(done_images, total_images)`` spans all cines; ``cancelled()`` is checked between cines.
+        """
+        import os
+        from .naming import DEFAULT_CINE_TEMPLATE, expand_name, tokens_in, unique_path
+        template = template or DEFAULT_CINE_TEMPLATE
+        if 'cinenr' not in tokens_in(template):
+            template += '_Cine{cinenr}'
+        folder = Path(folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        cines = self.stored_cines()
+        if not cines:
+            raise ValueError('no stored cine in camera RAM (no cine state holds STR)')
+        infos = {c: self.cine_info(c) for c in cines}
+        from .decimate import select_numbers
+        sizes = {c: len(select_numbers(int(infos[c]['firstfr']), int(infos[c]['lastfr']), kw.get('step', 1),
+                                       kw.get('align', 'trigger'))) for c in cines}
+        total, done, out = sum(sizes.values()), 0, []
+        for k, c in enumerate(cines, 1):
+            if cancelled is not None and cancelled():
+                break
+            name = expand_name(template, **dict(self.name_fields(c, infos[c]), count=k))
+            if not name.lower().endswith('.cine'):
+                name += '.cine'
+            path = unique_path(folder / name)
+            part = path.with_name(path.name + '.part')
+
+            def prog(d, t, base=done):
+                if progress:
+                    progress(base + d, total)
+            try:
+                res = self.download(c, part, progress=prog, **kw)
+                os.replace(part, path)
+            except BaseException:
+                part.unlink(missing_ok=True)
+                raise
+            res['path'] = str(path)
+            out.append(res)
+            done += sizes[c]
+        return out
+
+    def _write_download(self, path, size, numbers, packing, out_first, fields, tsec, frac64, ci, have_times,
+                        cine, fmt, chunk, year0, as_12bit, progress, crop=None):
+        with CineWriter(path, size[0], size[1], len(numbers), packing, first_image_no=out_first,
                         setup_fields=fields, trigger_time=(tsec, frac64),
                         first_movie_image=int(ci['firstfr']), total_image_count=int(ci['lastfr'] - ci['firstfr'] + 1),
                         with_times=True, with_exposures=have_times) as w:
@@ -576,9 +668,7 @@ class Camera:
                 t64 = (tsec << 32) + frac64 + t_rel
                 t = (t64 >> 32, t64 & 0xFFFFFFFF)
                 if s is not None:
-                    sec = year0 + s.csecs // 100
-                    usec = (s.csecs % 100) * 10000 + (s.frac >> 2)
-                    t = (sec, int(usec * (1 << 32) // 1_000_000))
+                    t = stamp_time64(s, year0)
                     # The stamp's exposure is whole microseconds (16-bit). When it agrees with the
                     # cine's exposure setting (ns) to within that resolution, store the precise
                     # setting; otherwise (e.g. auto-exposure changed it) keep the stamp's value.
@@ -588,6 +678,7 @@ class Camera:
                         e = int(exp_ns * (1 << 32) // 1_000_000_000)
                     else:
                         e = int(s.exptime_us * (1 << 32) // 1_000_000)
+                frame = crop_image(frame, crop)     # the stored rectangle only (P10: codes, cropped as codes)
                 if as_12bit:
                     dropped[0] += int(np.count_nonzero(frame & 0xF))
                     dropped[1] += frame.size

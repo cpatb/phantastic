@@ -44,7 +44,7 @@ class HeaderDialog(QDialog):
 
 class PlayTab(QWidget):
     cine_chosen = Signal(object)       # key of the cine picked in the 'Cine:' combo
-    save_requested = Signal(str)       # 'cine', 'tiff_raw' or 'tiff_pcc'
+    save_requested = Signal(str)       # 'cine', 'save_all', 'tiff_raw', 'tiff_pcc', 'tiff_seq' or 'mp4'
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -201,8 +201,15 @@ class PlayTab(QWidget):
         menu = QMenu(self.save_btn)
         self.save_action = menu.addAction('Save Cine To File', lambda: self.save_requested.emit('cine'))
         self.tiff_raw_action = menu.addAction('Export TIFF (raw values)...', lambda: self.save_requested.emit('tiff_raw'))
+        self.save_all_action = menu.addAction('Save All RAM Cines to File...',
+                                              lambda: self.save_requested.emit('save_all'))   # p.62
+        menu.addSeparator()
         self.tiff_pcc_action = menu.addAction('Export TIFF as PCC would (8-bit)...',
                                               lambda: self.save_requested.emit('tiff_pcc'))
+        self.tiff_seq_action = menu.addAction('Export TIFF image sequence...',
+                                              lambda: self.save_requested.emit('tiff_seq'))   # p.72, 76
+        self.mp4_action = menu.addAction('Export MP4 (8-bit display render)...',
+                                         lambda: self.save_requested.emit('mp4'))           # p.75
         self.save_btn.setMenu(menu)
         self.save_btn.clicked.connect(lambda: self.save_requested.emit('cine'))
         self.save_btn.setToolTip('Save Cine To File (Ctrl+S); the arrow offers TIFF exports')
@@ -288,10 +295,16 @@ class PlayTab(QWidget):
             self.ci_form.addRow(label, v)
         is_file = panel.source.kind == 'file'
         self.header_btn.setVisible(is_file)
-        why = 'Save the cine to a file first, then open the file to export TIFF.'
-        for a in (self.tiff_raw_action, self.tiff_pcc_action):
-            a.setEnabled(is_file)
-            a.setToolTip('' if is_file else why)
+        # raw TIFF, TIFF sequence and MP4 work straight from camera RAM; PCC-identical TIFF needs a file's
+        # display settings; Save All is for the camera's RAM cines
+        self.tiff_pcc_action.setEnabled(is_file)
+        self.tiff_pcc_action.setToolTip('' if is_file else 'Needs a saved file\'s display settings: save the cine, '
+                                        'open the file, then export.')
+        self.save_all_action.setEnabled(not is_file)
+        from ..export import MP4_MISSING, find_ffmpeg
+        have = find_ffmpeg() is not None
+        self.mp4_action.setEnabled(have)
+        self.mp4_action.setToolTip('' if have else MP4_MISSING)
         self.goto_spin.setRange(panel.source.first, panel.source.last)
         self.update_view()
 

@@ -14,7 +14,6 @@ TIFF export writes the raw sensor values (16-bit), top-down, with no LUT, gain, 
 """
 from __future__ import annotations
 
-import json
 import math
 import re
 from pathlib import Path
@@ -91,17 +90,32 @@ def _indices(r: CineReader, first, last, step, align) -> np.ndarray:
 
 
 def decimate_cine(src, dst, step: int, align: str = 'trigger', first: int | None = None,
-                  last: int | None = None, progress=None) -> dict:
+                  last: int | None = None, progress=None, crop=None) -> dict:
     """Write a new cine holding the selected images, bit-for-bit (pixels, time stamps, exposures).
 
     Output image k is source image k*step + offset (see :func:`renumbering`); with the default
     align='trigger' this is PCC's numbering and the trigger frame stays image 0. True times are
     kept in the per-image time stamps; SETUP.FrameRate keeps the recording rate, as PCC does.
+
+    ``crop`` = (x, y, w, h) (top-down, see :mod:`phantastic.crop`): only that rectangle is written,
+    values unchanged (re-packed in the source's packing; P10 codes are copied as codes). The file's
+    ImWidth/ImHeight become w/h and the Description records the crop; ImPosXAcq/ImPosYAcq are left
+    alone because their meaning is not established. Written to ``dst + '.part'`` and renamed.
     """
+    from .crop import check_crop, crop_image, crop_note
+    from .export import atomic_path, check_not_source
+    check_not_source(src, dst)
     with CineReader(src) as r:
         idx = _indices(r, first, last, step, align)
         if len(idx) == 0:
             raise ValueError('no images selected')
+        crop = check_crop(crop, r.width, r.height, r.packing)
+        if crop and r.setup.get('CFA', 0) and not r.is_color and any(v % 2 for v in crop):
+            # Raw colour-sensor data: an odd offset shifts the colour-filter phase that SETUP.CFA describes.
+            # Whether CFA counts from the top row or the first STORED row (the bottom, for 16-bit files) is not
+            # established, so x, y, w and h must all be even: then both edges keep their phase.
+            raise ValueError(f'this is raw colour-sensor data (SETUP.CFA = {r.setup["CFA"]}): crop x, y, w and h '
+                             'must all be even, or the colour pattern would no longer match the file\'s CFA field')
         n_src = len(r)
         times = r.image_times_raw() if r.has_complete_times() else None
         synthesized = times is None
@@ -135,80 +149,68 @@ def decimate_cine(src, dst, step: int, align: str = 'trigger', first: int | None
                 f'pixels copied verbatim; time stamps '
                 f'{"SYNTHESIZED from number/frame rate (source had none)" if synthesized else "copied"}'
                 f'{"; dropped non-per-image blocks " + str(dropped) if dropped else ""}.')
-        w = CineWriter(dst, r.width, r.height, len(idx), r.packing, first_image_no=out_first,
-                       setup=r.setup_raw, setup_fields={'Description': append_note(desc, note)},
-                       trigger_time=r.header['TriggerTime'], compression=r.header['Compression'],
-                       first_movie_image=r.header['FirstMovieImage'], total_image_count=r.header['TotalImageCount'],
-                       with_times=True, with_exposures=exps is not None,
-                       clr_important=r.bitmap['biClrImportant'],
-                       pels_per_meter=(r.bitmap['biXPelsPerMeter'], r.bitmap['biYPelsPerMeter']),
-                       stride=r.stride, extra_blocks=extra)
-        with w:
-            for k, i in enumerate(idx):
-                t = (int(times[i, 1]), int(times[i, 0]))
-                e = None if exps is None else int(exps[i])
-                w.append_stored(r.stored_bytes(int(i)), time=t, exposure=e)
-                if progress:
-                    progress(k + 1, len(idx))
+        fields = {}
+        if crop:
+            note += ' ' + crop_note(crop, r.width, r.height)
+            fields.update(ImWidth=crop[2], ImHeight=crop[3])
+        fields['Description'] = append_note(desc, note)
+        w_out, h_out = (crop[2], crop[3]) if crop else (r.width, r.height)
+        with atomic_path(dst) as part:
+            w = CineWriter(part, w_out, h_out, len(idx), r.packing, first_image_no=out_first,
+                           setup=r.setup_raw, setup_fields=fields,
+                           trigger_time=r.header['TriggerTime'], compression=r.header['Compression'],
+                           first_movie_image=r.header['FirstMovieImage'], total_image_count=r.header['TotalImageCount'],
+                           with_times=True, with_exposures=exps is not None,
+                           clr_important=r.bitmap['biClrImportant'],
+                           pels_per_meter=(r.bitmap['biXPelsPerMeter'], r.bitmap['biYPelsPerMeter']),
+                           stride=None if crop else r.stride, extra_blocks=extra)
+            with w:
+                for k, i in enumerate(idx):
+                    t = (int(times[i, 1]), int(times[i, 0]))
+                    e = None if exps is None else int(exps[i])
+                    if crop is None:
+                        w.append_stored(r.stored_bytes(int(i)), time=t, exposure=e)
+                    else:   # decode, cut, re-pack: CineWriter takes P10 as codes, everything else as values
+                        img = r.read_codes10(int(i)) if r.packing == 'packed10' else r.read(int(i))
+                        w.append(crop_image(img, crop), time=t, exposure=e)
+                    if progress:
+                        progress(k + 1, len(idx))
     return dict(src=str(src), dst=str(dst), count=len(idx), first=first_no, step=step, align=align,
-                first_out=out_first, offset=offset)
+                first_out=out_first, offset=offset, crop=crop)
+
+
+def load_pcc_table(src, pcc_table):
+    """(table array, its path) for ``pcc_table`` = 'auto' (the shipped table matching ``src``) or a path."""
+    from .pcc_render import find_table, load_table
+    if pcc_table == 'auto':
+        found = find_table(src)
+        if found is None:
+            raise ValueError('no measured PCC table matches this file\'s display settings '
+                             '(derive one with tools/make_lut_probe.py + tools/vendor_export_probe.py)')
+        pcc_table = found['csv']
+    return load_table(pcc_table), str(pcc_table)
 
 
 def export_tiff(src, dst, first: int | None = None, last: int | None = None, step: int = 1,
-                align: str = 'trigger', progress=None, pcc_table=None) -> dict:
+                align: str = 'trigger', progress=None, pcc_table=None, crop=None) -> dict:
     """Export selected images as a multi-page TIFF of raw sensor values (no processing).
 
     With ``pcc_table`` (a measured PCC export table, see :mod:`phantastic.pcc_render`) the pages
     are instead what PCC's TIFF export would write for the same settings, bit for bit; the
-    metadata says so.
+    metadata says so. ``crop`` = (x, y, w, h), top-down (see :mod:`phantastic.crop`).
 
     Mono: uint8 or uint16 pages exactly as decoded (P10 -> 12-bit linear). Colour: RGB pages.
     Per-frame image numbers and times go into a JSON ImageDescription on page 0 and a JSON
     sidecar (``<dst>.json``, including the frame interval). ImageJ's own frame-interval tag is not
-    written, so Fiji shows the interval only via the sidecar.
+    written, so Fiji shows the interval only via the sidecar. Both are written under temporary
+    names and renamed on success (:func:`phantastic.export.write_tiff_stack`).
     """
-    import tifffile
-    with CineReader(src) as r:
-        idx = _indices(r, first, last, step, align)
-        if len(idx) == 0:
-            raise ValueError('no images selected')
-        rel = r.relative_times()
-        numbers = (r.first + idx).tolist()
-        meta = {
-            'source': str(src), 'software': 'Phantastic',
-            'processing': ('PCC export table ' + str(pcc_table)) if pcc_table is not None else 'none (raw sensor values)',
-            'real_bpp': r.real_bpp, 'packing': r.packing, 'frame_rate_setup': r.frame_rate,
-            'image_numbers': numbers, 'time_rel_trigger_s': [float(rel[i]) for i in idx],
-            'step': step, 'align': align,
-            'setup': {k: v for k, v in r.setup.items() if isinstance(v, (int, float, str))},
-        }
-        table = None
-        if pcc_table is not None:
-            from .pcc_render import find_table, load_table, render
-            if pcc_table == 'auto':
-                found = find_table(src)
-                if found is None:
-                    raise ValueError('no measured PCC table matches this file\'s display settings '
-                                     '(derive one with tools/make_lut_probe.py + tools/vendor_export_probe.py)')
-                pcc_table = found['csv']
-            table = load_table(pcc_table)
-        sample = r.read(int(idx[0]))
-        big = sample.nbytes * len(idx) > 3.9e9
-        finterval = float(np.median(np.diff(rel[idx]))) if len(idx) > 1 else 1.0 / max(r.frame_rate, 1)
-        with tifffile.TiffWriter(dst, bigtiff=big) as tw:
-            for k, i in enumerate(idx):
-                img = r.read(int(i))
-                if table is not None:
-                    img = render(img, table, np.uint8 if table.max() < 256 else np.uint16)
-                tw.write(img, contiguous=False, photometric='rgb' if img.ndim == 3 else 'minisblack',
-                         description=json.dumps(meta) if k == 0 else None,
-                         metadata=None, software='Phantastic')
-                if progress:
-                    progress(k + 1, len(idx))
-        # ImageJ reads frame interval from its own description format; write a sidecar for
-        # tools that do not parse the JSON (Fiji: Image > Properties).
-        Path(str(dst) + '.json').write_text(json.dumps(dict(meta, finterval_s=finterval), indent=1))
-    return dict(dst=str(dst), count=len(idx), first=numbers[0], last=numbers[-1], finterval_s=finterval)
+    from .export import FileFrames, check_not_source, write_tiff_stack
+    check_not_source(src, dst)
+    check_not_source(src, str(dst) + '.json')
+    table, name = load_pcc_table(src, pcc_table) if pcc_table is not None else (None, None)
+    with FileFrames(src, first, last, step, align) as fr:
+        return write_tiff_stack(fr, dst, crop=crop, table=table, table_name=name, progress=progress)
 
 
 __all__ = ['select_numbers', 'decimate_cine', 'export_tiff', 'TAG_EXPOSURE_ONLY']

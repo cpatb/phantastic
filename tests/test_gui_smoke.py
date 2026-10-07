@@ -289,7 +289,9 @@ def test_play_camera_cine_marks_and_save(win, tmp_path):
     assert win.playbacks[('camera', 1)].windowTitle() == f'{SERIAL} > Cine 1'
     wait_until(lambda: panel.frame is not None, what='first camera frame')
     assert panel.shown == 0 and np.array_equal(panel.frame, p16(0))  # opens at the trigger image
-    assert not play.tiff_raw_action.isEnabled() and not play.tiff_pcc_action.isEnabled()
+    # raw TIFF / sequence / MP4 export straight from camera RAM; PCC-identical TIFF needs a saved file
+    assert play.tiff_raw_action.isEnabled() and play.tiff_seq_action.isEnabled() and play.save_all_action.isEnabled()
+    assert not play.tiff_pcc_action.isEnabled()
 
     def show(n):
         wait_until(lambda: panel.shown == n and panel.frame is not None, what=f'image {n}')
@@ -610,3 +612,31 @@ def test_export_tiff_pcc_identical(win, tmp_path):
     assert tif.error is None, tif.summary.toPlainText()
     assert 'PCC-identical' in tif.summary.toPlainText()
     assert np.array_equal(tifffile.imread(tmp_path / 'pcc.tif'), tifffile.imread(cal / 'side1_2.tif'))
+
+
+def test_crop_drawn_on_panel_reaches_saved_cine(win, tmp_path):
+    """Integration of the two halves: Image Tools' crop rectangle (stored-array, top-down) -> Save Cine."""
+    connect_and_record(win)
+    win.manager_tab.tree.itemDoubleClicked.emit(win.manager_tab.find(('cine', 1)), 0)
+    panel = win.play_tab.panel
+    wait_until(lambda: panel.frame is not None, what='first camera frame')
+    rect = (13, 5, 37, 21)                                      # odd sizes, away from every edge
+    panel.set_crop_rect(rect)
+    assert panel.crop_rect() == rect
+    dlg = win.save_cine()
+    dlg.crop_widget.refresh()
+    assert dlg.crop_widget.rect_check.isEnabled()
+    dlg.crop_widget.rect_check.setChecked(True)
+    dlg.range.set_values(first=-4, last=3, step=1)
+    out = tmp_path / 'cropped.cine'
+    dlg.path_edit.setText(str(out))
+    dlg.start_btn.click()
+    wait_until(lambda: dlg.result_info is not None or dlg.error is not None, what='cropped save')
+    assert dlg.error is None, dlg.summary.toPlainText()
+    x, y, w, h = rect
+    with CineReader(out) as r:
+        assert (r.width, r.height, len(r), r.first) == (w, h, 8, -4)
+        assert r.real_bpp == 12                                 # Save Cine default: PCC-compatible 12-bit
+        for k, n in ((0, -4), (7, 3)):
+            assert np.array_equal(r.read(k), p16(n)[y:y + h, x:x + w] >> 4)   # exactly the numpy slice
+        assert f'at {x},{y}' in r.setup['Description']          # the crop is recorded, not silent

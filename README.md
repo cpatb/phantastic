@@ -35,6 +35,7 @@ To record what PCC does with your own camera: [docs/CAPTURE_PCC_SESSION.md](docs
 ```
 pip install .            # command line + library (numpy, tifffile)
 pip install .[gui]       # + desktop app (PySide6)
+pip install .[video]     # + MP4 export (imageio-ffmpeg bundles ffmpeg; or have ffmpeg with libx264 on PATH)
 ```
 
 ## Use
@@ -75,6 +76,10 @@ phantastic download --ip 100.100.1.1 --cine 1 --out burst.cine --first -200 --co
 phantastic decimate shot.cine shot_x10.cine --step 10
 phantastic tiff shot.cine shot.tif --first -500 --last 500
 phantastic tiff shot.cine shot_pcc.tif --pcc-table auto      # bit-identical to PCC's 8-bit export
+phantastic tiff shot.cine frames/ --sequence                 # one TIFF per image: shot_m000005.tif ... shot_000049.tif
+phantastic decimate shot.cine roi.cine --step 1 --crop 100,40,256,128   # x,y,w,h, rows from the top; recorded in the file
+phantastic mp4 shot.cine talk.mp4 --fps 30 --white 3000 --border       # 8-bit display render, NOT for measurement
+phantastic download --ip 100.100.1.1 --all --out-dir D:/run7 --name 'cine{cinenr}_{serial}'   # Save All RAM Cines
 phantastic simulate --profile miro-m310
 ```
 
@@ -100,6 +105,12 @@ n = r.image_numbers          # camera image numbers (trigger = 0)
 * **Decimated cines are renumbered.** A cine numbers its images consecutively, so image k of a
   file decimated by N is camera image k·N (+ offset, written in the file description). Times come
   from the per-image time stamps, which are copied unchanged.
+* **Crop writes the rectangle, not a note.** PCC keeps a Cine Raw crop as metadata and applies it
+  only on conversion; Phantastic's `crop=(x, y, w, h)` (0-based, rows from the top) stores the smaller
+  image, values unchanged, and writes "Cropped from WxH at x,y" into the Description (TIFF/MP4: the
+  JSON metadata). A packed (P10/P12L) cine crop must be a whole number of packed groups wide.
+* **MP4 is for viewing.** It is an 8-bit render through a black/white window and gamma, H.264
+  compressed; the file and its `.json` sidecar say so. True image numbers and times are in the sidecar.
 * **10-bit packed (P10) is companded.** It is linearised to 12 bit with the table from the Cine
   File Format specification.
 
