@@ -316,8 +316,9 @@ def test_play_camera_cine_marks_and_save(win, tmp_path):
     show(PT - 1)
     for y, x in ((10, 20), (0, 7)):
         hover(panel.view, x, y)
-        assert panel.last_readout == (x, y, int(p16(PT - 1)[y, x]))
-        assert win.value_label.text() == f'Value: {int(p16(PT - 1)[y, x])}'
+        assert panel.last_readout == (x, y, int(p16(PT - 1)[y, x]))          # raw P16 as sent
+        sensor = int(synthetic_frame(PT - 1, W, H, seed=1)[y, x])             # camera P16 shown on the 12-bit scale
+        assert win.value_label.text() == f'Value: {sensor} (12-bit)'
 
     # Mark-In / Mark-Out with [ and ]
     type_goto(play, -603)

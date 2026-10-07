@@ -27,8 +27,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         apply_pcc_style(app)
     win = MainWindow()
-    win.resize(1456, 868)
-    win.showMaximized()                     # this user's PCC: StartMaximized=true
+    if win.geometry_restored:               # last session's window (QSettings)
+        win.show()
+    else:
+        win.resize(1456, 868)
+        win.showMaximized()                 # this user's PCC: StartMaximized=true
     for f in args.files:
         win.open_file(f)
     if args.simulator:
