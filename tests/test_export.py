@@ -304,6 +304,24 @@ def test_mp4_rotate_flip_and_render_hook(tmp_path):
     assert not (tmp_path / 'x.mp4').exists()
 
 
+@needs_ffmpeg
+def test_mp4_colour_source(tmp_path):
+    """A flat orange (R 200, G 90, B 20) must come out orange: catches a BGR/RGB swap."""
+    src = tmp_path / 'c.cine'
+    rgb = np.empty((H, W, 3), np.uint8)
+    rgb[:] = (200, 90, 20)
+    with CineWriter(src, W, H, 2, 'bgr24', setup_fields={'FrameRate': 100, 'RealBPP': 8}) as w:
+        for k in range(2):
+            w.append(rgb, time=(T0, k << 24), exposure=1)
+    with CineReader(src) as r:
+        assert tuple(r.read(0)[0, 0]) == (200, 90, 20)
+    res = export_mp4(src, tmp_path / 'c.mp4', black=0, white=255, border=True)
+    _, fr = mp4_frames(tmp_path / 'c.mp4')
+    assert len(fr) == 2 and res['size'][1] > H
+    got = fr[0][2:H - 2, 2:W - 2].astype(float).mean(axis=(0, 1))     # away from the chroma edge
+    assert np.abs(got - (200, 90, 20)).max() < 6, got
+
+
 def test_window_render():
     r = window_render(100, 300, 1.0)
     assert np.array_equal(r(np.array([0, 100, 200, 300, 4000])), [0, 0, 128, 255, 255])
