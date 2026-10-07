@@ -289,7 +289,9 @@ def test_play_camera_cine_marks_and_save(win, tmp_path):
     assert win.playbacks[('camera', 1)].windowTitle() == f'{SERIAL} > Cine 1'
     wait_until(lambda: panel.frame is not None, what='first camera frame')
     assert panel.shown == 0 and np.array_equal(panel.frame, p16(0))  # opens at the trigger image
-    assert not play.tiff_raw_action.isEnabled() and not play.tiff_pcc_action.isEnabled()
+    # raw TIFF / sequence / MP4 export straight from camera RAM; PCC-identical TIFF needs a saved file
+    assert play.tiff_raw_action.isEnabled() and play.tiff_seq_action.isEnabled() and play.save_all_action.isEnabled()
+    assert not play.tiff_pcc_action.isEnabled()
 
     def show(n):
         wait_until(lambda: panel.shown == n and panel.frame is not None, what=f'image {n}')

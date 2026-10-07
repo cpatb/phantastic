@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFormLayout, QGridLayo
 
 from .. import protocol as P
 from .dialogs import SaveCineDialog
+from ..naming import DEFAULT_CINE_TEMPLATE
 from .widgets import GREEN, RED, CollapsibleSection, TriggerBar, big_button
 from .workers import CameraSession, TaskManager, describe_error
 
@@ -496,13 +497,13 @@ class LiveTab(QWidget):
         return sorted(c for c, ci in self.cine_infos.items() if ci.get('firstfr') is not None)
 
     def make_save_dialog(self, cine: int, marks: tuple[int, int] | None = None,
-                         default_dir: str | None = None) -> SaveCineDialog:
+                         default_dir: str | None = None, panel=None) -> SaveCineDialog:
         info = self.cine_infos.get(cine)
         if info is None or info.get('firstfr') is None:
             raise ValueError(f'cine {cine} has no stored recording (state must contain STR)')
-        serial = self.session.info.get('serial', 'cam')
-        default = str(Path(default_dir or Path.home()) / f'cine{cine}_{serial}.cine')
+        # the default name is a template (PCC p.66-73) that expands to today's cine<N>_<serial>.cine
+        default = str(Path(default_dir or Path.home()) / f'{DEFAULT_CINE_TEMPLATE}.cine')
         dlg = SaveCineDialog(self.tasks, self.session, cine, info, default_path=default, marks=marks,
-                             parent=self.window())
+                             parent=self.window(), panel=panel)
         self.dialogs = [d for d in self.dialogs if d.isVisible()] + [dlg]
         return dlg

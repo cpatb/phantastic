@@ -600,14 +600,11 @@ class Camera:
     def name_fields(self, cine: int, info: dict | None = None) -> dict:
         """Values for the file-name tokens of :mod:`phantastic.naming` (serial, camera name, cine
         number, trigger date/time)."""
-        from .naming import time_fields
+        from .naming import cine_fields
         ci = info if info is not None else self.cine_info(cine)
         trig = ci.get('trigtime') if isinstance(ci.get('trigtime'), dict) else {}
-        serial = self._safe_get('info.serial', None)
-        name = self._safe_get('info.name', None)
-        return dict(cinenr=int(cine), serial=None if serial is None else int(serial),
-                    camname=str(name) if name else (f'serial{serial}' if serial is not None else None),
-                    **time_fields(int(trig.get('secs', 0)) or None))
+        return cine_fields(cine, self._safe_get('info.serial', None), self._safe_get('info.name', None),
+                           int(trig.get('secs', 0)) or None)
 
     def download_all(self, folder, template: str | None = None, progress=None, cancelled=None, **kw) -> list[dict]:
         """Save All RAM Cines (PCC manual p.62): every stored cine, full range, to ``folder``.
@@ -636,7 +633,7 @@ class Camera:
         for k, c in enumerate(cines, 1):
             if cancelled is not None and cancelled():
                 break
-            name = expand_name(template, count=k, **self.name_fields(c, infos[c]))
+            name = expand_name(template, **dict(self.name_fields(c, infos[c]), count=k))
             if not name.lower().endswith('.cine'):
                 name += '.cine'
             path = unique_path(folder / name)

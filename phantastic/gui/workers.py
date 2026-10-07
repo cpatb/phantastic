@@ -212,7 +212,7 @@ def _discard(paths: list[Path]) -> list[str]:
 
 
 def download_cine(session: CameraSession, cine: int, path, first: int, last: int, step: int, align: str,
-                  fmt: str, task: Task, lock_timeout: float = 3.0, as_12bit: bool = False) -> dict:
+                  fmt: str, task: Task, lock_timeout: float = 3.0, as_12bit: bool = False, crop=None) -> dict:
     """Download a stored camera cine to ``path`` (the work behind the Save cine dialog).
 
     Writes to ``path + '.part'`` and renames on success, so a cancelled or failed download never
@@ -227,7 +227,7 @@ def download_cine(session: CameraSession, cine: int, path, first: int, last: int
     try:
         with session.use(timeout=lock_timeout) as cam:
             res = cam.download(cine, part, first=first, last=last, step=step, fmt=fmt, align=align,
-                               progress=task.progress, as_12bit=as_12bit)
+                               progress=task.progress, as_12bit=as_12bit, crop=crop)
         os.replace(part, path)
     except BaseException as e:
         e.partial_deleted = _discard([part])   # type: ignore[attr-defined]
@@ -237,23 +237,33 @@ def download_cine(session: CameraSession, cine: int, path, first: int, last: int
 
 
 def export_file(kind: str, src, dst, first: int, last: int, step: int, align: str, task: Task,
-                pcc_table: str | None = None) -> dict:
+                pcc_table: str | None = None, crop=None, pattern: str | None = None, mp4: dict | None = None) -> dict:
     """File > Export: 'cine' -> decimate_cine (lossless), 'tiff' -> export_tiff (raw values, or
-    PCC's 8-bit export reproduced from a measured table when ``pcc_table`` is given)."""
+    PCC's 8-bit export reproduced from a measured table when ``pcc_table`` is given), 'tiffseq' ->
+    one TIFF per image into the folder ``dst``, 'mp4' -> H.264 display render (``mp4`` = options
+    of :func:`phantastic.export.write_mp4`). ``crop`` = (x, y, w, h) for every kind."""
     from ..decimate import decimate_cine, export_tiff
+    from ..export import export_mp4, export_tiff_sequence
     src, dst = Path(src), Path(dst)
     if src.resolve() == dst.resolve():
         raise ValueError('refusing to write over the source file; choose another output path')
+    task.check_cancelled()
+    if kind == 'tiffseq':       # the library writes into a hidden folder and moves the files at the end
+        return export_tiff_sequence(src, dst, first, last, step, align, pattern=pattern or '{source}_{image6}',
+                                    crop=crop, pcc_table=pcc_table, progress=task.progress)
+    if kind == 'mp4':           # the library writes <dst>.part (+ sidecar) and renames on success
+        return export_mp4(src, dst, first, last, step, align, progress=task.progress, crop=crop, **(mp4 or {}))
     part = part_path(dst)
     sidecar_part, sidecar = Path(str(part) + '.json'), Path(str(dst) + '.json')
     task.check_cancelled()
     try:
         if kind == 'cine':
-            res = decimate_cine(src, part, step, align=align, first=first, last=last, progress=task.progress)
+            res = decimate_cine(src, part, step, align=align, first=first, last=last, progress=task.progress,
+                                crop=crop)
             res['dst'] = str(dst)
         elif kind == 'tiff':
             res = export_tiff(src, part, first=first, last=last, step=step, align=align, progress=task.progress,
-                              pcc_table=pcc_table)
+                              pcc_table=pcc_table, crop=crop)
             res['pcc_table'] = pcc_table
             os.replace(sidecar_part, sidecar)
             res['dst'] = str(dst)
@@ -264,4 +274,48 @@ def export_file(kind: str, src, dst, first: int, last: int, step: int, align: st
     except BaseException as e:
         e.partial_deleted = _discard([part, sidecar_part])   # type: ignore[attr-defined]
         raise
+    return res
+
+
+def export_camera(session: CameraSession, cine: int, kind: str, dst, first: int, last: int, step: int, align: str,
+                  task: Task, fmt: str = 'P16', as_12bit: bool = False, crop=None, pattern: str | None = None,
+                  mp4: dict | None = None, lock_timeout: float = 3.0) -> dict:
+    """Export straight from camera RAM, no save-then-open: 'tiff' (stack), 'tiffseq' (one file per image
+    into the folder ``dst``) or 'mp4'. Holds the camera for the whole export, as a download does."""
+    from ..export import CameraFrames, write_mp4, write_tiff_sequence, write_tiff_stack
+    task.check_cancelled()
+    dst = Path(dst)
+    with session.use(timeout=lock_timeout) as cam:
+        fr = CameraFrames(cam, cine, first, last, step, align, fmt=fmt, as_12bit=as_12bit)
+        if kind == 'tiff':
+            part, sidecar_part = part_path(dst), Path(str(part_path(dst)) + '.json')
+            try:
+                res = write_tiff_stack(fr, part, crop=crop, progress=task.progress)
+                os.replace(sidecar_part, str(dst) + '.json')
+                os.replace(part, dst)
+            except BaseException as e:
+                e.partial_deleted = _discard([part, sidecar_part])   # type: ignore[attr-defined]
+                raise
+            res.update(dst=str(dst), sidecar=str(dst) + '.json')
+        elif kind == 'tiffseq':
+            res = write_tiff_sequence(fr, dst, pattern or '{source}_{image6}', crop=crop,
+                                      fields={'serial': session.info.get('serial'), 'cinenr': cine},
+                                      progress=task.progress)
+        elif kind == 'mp4':
+            res = write_mp4(fr, dst, crop=crop, progress=task.progress, **(mp4 or {}))
+        else:
+            raise ValueError(kind)
+        session.trim_transcript()
+    res.update(cine=cine, fmt=fmt, as_12bit=as_12bit)
+    return res
+
+
+def download_all(session: CameraSession, folder, template: str, fmt: str, task: Task, as_12bit: bool = False,
+                 lock_timeout: float = 3.0) -> list[dict]:
+    """Save All RAM Cines (PCC p.62): every stored cine to ``folder`` (see :meth:`Camera.download_all`)."""
+    task.check_cancelled()
+    with session.use(timeout=lock_timeout) as cam:
+        res = cam.download_all(folder, template, progress=task.progress, cancelled=task.cancelled.is_set,
+                               fmt=fmt, as_12bit=as_12bit)
+        session.trim_transcript()
     return res

@@ -103,6 +103,15 @@ def time_fields(unix_seconds: float | None) -> dict:
     return {'date': t.strftime('Y%Y%m%d'), 'time': t.strftime('H%H%M%S')}
 
 
+def cine_fields(cinenr: int, serial=None, camname=None, trigger_secs: float | None = None, count: int = 1) -> dict:
+    """Token values for a camera cine. {camname} falls back to 'serial<N>' (PCC builds {name}
+    from the serial number when the camera has none, p.68)."""
+    if not camname and serial is not None:
+        camname = f'serial{serial}'
+    return dict(cinenr=int(cinenr), serial=None if serial is None else int(serial),
+                camname=str(camname) if camname else None, count=count, **time_fields(trigger_secs))
+
+
 def unique_path(path) -> Path:
     """``path`` if free, else the first free ``stem_1.ext``, ``stem_2.ext``, ... (never overwrites).
 

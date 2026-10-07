@@ -175,7 +175,9 @@ class MainWindow(QMainWindow):
         self.batch_btn = self._menu_button(self.batch_action, (
             ('Decimated cine (lossless)...', lambda: self.export('cine')),
             ('TIFF stack (raw values)...', lambda: self.export('tiff')),
-            ('TIFF as PCC would (8-bit)...', lambda: self.export('tiff', 'pcc'))), instant=True)
+            ('TIFF as PCC would (8-bit)...', lambda: self.export('tiff', 'pcc')),
+            ('TIFF image sequence (one file per image)...', lambda: self.export('tiffseq')),
+            ('MP4 movie (8-bit display render)...', lambda: self.export('mp4'))), instant=True)
         tb.addWidget(self.batch_btn)
         tb.addSeparator()
         # App: Window Tile, Window Auto Tile, Help + pull-down
@@ -684,13 +686,13 @@ class MainWindow(QMainWindow):
         marks = (p.mark_in, p.mark_out)
         if p.source.kind == 'camera':
             try:
-                dlg = self.live_tab.make_save_dialog(p.source.cine, marks=marks)
+                dlg = self.live_tab.make_save_dialog(p.source.cine, marks=marks, panel=p)
             except ValueError as e:
                 self.report_error(str(e))
                 return None
         else:
             src = p.source
-            dlg = ExportDialog(self.tasks, 'cine', src.path, src.first, src.last, marks=marks, parent=self)
+            dlg = ExportDialog(self.tasks, 'cine', src.path, src.first, src.last, marks=marks, parent=self, panel=p)
         dlg.setWindowModality(Qt.WindowModality.WindowModal)   # the marks it was given cannot move under it
         self._track(dlg).show()
         self._last_dialog = dlg
@@ -703,15 +705,52 @@ class MainWindow(QMainWindow):
             self.export('tiff')
         elif what == 'tiff_pcc':
             self.export('tiff', 'pcc')
+        elif what == 'tiff_seq':
+            self.export('tiffseq')
+        elif what == 'mp4':
+            self.export('mp4')
+        elif what == 'save_all':
+            self.save_all()
+
+    def _active_playback_panel(self) -> PlaybackPanel | None:
+        for p in (self.active_panel, self.play_tab.panel):
+            if isinstance(p, PlaybackPanel):
+                return p
+        return None
+
+    def save_all(self):
+        """Save All RAM Cines to File (PCC p.62)."""
+        if self.session is None or not self.live_tab.stored_cines():
+            self.report_error('No stored cine in camera RAM')
+            return None
+        from .dialogs import SaveAllDialog
+        infos = {c: self.live_tab.cine_infos[c] for c in self.live_tab.stored_cines()}
+        dlg = SaveAllDialog(self.tasks, self.session, infos, str(Path.home()), parent=self)
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        self._track(dlg).show()
+        self._last_dialog = dlg
+        return dlg
 
     def export(self, kind: str, values: str = 'raw') -> ExportDialog | None:
+        cp = self._active_playback_panel()
+        if cp is not None and cp.source.kind == 'camera' and kind in ('tiff', 'tiffseq', 'mp4') and values == 'raw':
+            # straight from camera RAM, no save-then-open
+            info = self.live_tab.cine_infos.get(cp.source.cine) or cp.source.info
+            dlg = ExportDialog(self.tasks, kind, None, cp.source.first, cp.source.last,
+                               marks=(cp.mark_in, cp.mark_out), parent=self,
+                               camera=(self.session, cp.source.cine, info), panel=cp)
+            dlg.setWindowModality(Qt.WindowModality.WindowModal)
+            self._track(dlg).show()
+            self._last_dialog = dlg
+            return dlg
         p = self._active_file_panel()
         if p is None:
-            self.report_error('Open a cine file first (Open File, Ctrl+O); camera cines must be saved first')
+            self.report_error('Open a cine file first (Open File, Ctrl+O); camera cines must be saved first'
+                              if values == 'pcc' or kind == 'cine' else 'Open a cine file or a camera cine first')
             return None
         src = p.source
         dlg = ExportDialog(self.tasks, kind, src.path, src.first, src.last, marks=(p.mark_in, p.mark_out),
-                           parent=self)
+                           parent=self, panel=p)
         if kind == 'tiff' and values == 'pcc':
             if dlg.pcc_table is None:
                 self.report_error('PCC-identical export is unavailable: no measured table matches this file')
