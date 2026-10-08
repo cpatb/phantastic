@@ -339,3 +339,18 @@ def test_stale_button_label_sends_nothing(win):
     assert live._capture_decided(False, 2, {'c1': P.Flags(('TRG', 'DEF', 'ACT')), 'c2': P.Flags(('RDY',))}) is None
     settle()
     assert writes(win, n) == [] and 'nothing was sent' in errors[-1]
+
+
+def test_reconnect_during_question_sends_nothing(win, monkeypatch):
+    from phantastic import protocol as P
+    live = win.live_tab
+    token = live._capture_token = object()            # a press in flight
+
+    def yes_after_reconnect(*a, **k):
+        live._capture_token = object()                  # what set_session + a new press would leave behind
+        return QMessageBox.StandardButton.Yes
+    monkeypatch.setattr(QMessageBox, 'warning', yes_after_reconnect)
+    n = len(win.simulator.model.received)
+    assert live._capture_decided(False, 1, {'c1': P.Flags(('STR', 'DEF'))}, token) is None
+    settle()
+    assert writes(win, n) == []

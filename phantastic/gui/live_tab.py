@@ -569,6 +569,8 @@ class LiveTab(QWidget):
                     'lose that recording. Abort anyway?', ask, QMessageBox.StandardButton.No) \
                     != QMessageBox.StandardButton.Yes:
                 return None
+            if not self._still_current(session, token):
+                return None
             return self._send_rec('Recording aborted (rec 0, back to preview)', lambda cam: cam.preview(), token)
         if cine and 'STR' in flags(states.get(f'c{cine}')):
             if QMessageBox.warning(self, 'Erase the recording in this cine?',
@@ -582,8 +584,18 @@ class LiveTab(QWidget):
             for k in [k for k in session.cine_info_cache if cine is None or k[0] == cine]:
                 del session.cine_info_cache[k]
             cam.record(cine)
+        if not self._still_current(session, token):
+            return None
         return self._send_rec(f'Recording into cine {cine if cine else "(next free)"}; waiting for trigger', rec,
                               token)
+
+    def _still_current(self, session, token) -> bool:
+        """After a modal question: is this still the camera whose states were read, and this press's turn?
+        (A dialog runs its own event loop, so a disconnect or reconnect can happen while it is open.)"""
+        ok = self.session is session and (token is None or self._capture_token is token)
+        if not ok:
+            self.error.emit('The camera connection changed while the question was open; nothing was sent.')
+        return ok
 
     def _send_rec(self, what: str, fn, token=None):
         """Run a rec command; the press's Capture guard is released when it has gone (or failed)."""
@@ -665,11 +677,12 @@ class LiveTab(QWidget):
     # ------------------------------------------------------------------ clock (PCC p.30-32)
     def set_time(self):
         """Set Time..: a dialog states what changes; only its Set button sends ``setrtc``."""
-        if self.session is None:
+        session = self.session
+        if session is None:
             return None
         dlg = SetTimeDialog(self.settings.camera_clock(), 'timezone' in self.settings.structs.get('cam', {}), self)
         self._set_time_dialog = dlg
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        if dlg.exec() != QDialog.DialogCode.Accepted or not self._still_current(session, None):
             return None
         return self.send_time(dlg.with_timezone)
 
