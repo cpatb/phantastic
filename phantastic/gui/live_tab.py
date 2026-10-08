@@ -81,7 +81,7 @@ class LiveTab(QWidget):
         self.dialogs: list[SaveCineDialog] = []
         self.bref_available = False
         self.last_csr: dict | None = None
-        self._capture_busy = False
+        self._capture_token: object | None = None     # set while one Capture/Abort press is in flight
 
         # -- top: Camera:
         self.camera_combo = QComboBox()
@@ -356,7 +356,7 @@ class LiveTab(QWidget):
             w.setEnabled(session is not None)
         self.trigger_btn.setEnabled(False)
         self.capture_btn.setText('Capture')
-        self._capture_busy = False
+        self._capture_token = None
         self.backup_label.setText('')
         self.csr_progress.setVisible(False)
         self.settings.set_session(session)      # reads with 'get' only; nothing is written on connect
@@ -521,9 +521,9 @@ class LiveTab(QWidget):
         if session is None:
             self.error.emit('Not connected')
             return None
-        if self._capture_busy:          # one Capture/Abort at a time: a second press must not send a second rec
+        if self._capture_token is not None:   # one Capture/Abort at a time: a second press must not send a 2nd rec
             return None
-        self._capture_busy = True
+        token = self._capture_token = object()   # released only by THIS press's callbacks
         abort, cine = self.recording, self.selected_cine()
 
         def job(task):
@@ -531,20 +531,26 @@ class LiveTab(QWidget):
                 return cam.cine_states()
 
         def done(states):
-            if session is not self.session:
-                self._capture_busy = False
-                return
-            self.cine_states = states
-            self._update_cines()
-            if self._capture_decided(abort, cine, states) is None:
-                self._capture_busy = False      # nothing sent (cancelled, or the state changed)
+            sent = None
+            try:
+                if session is self.session and token is self._capture_token:
+                    self.cine_states = states
+                    self._update_cines()
+                    sent = self._capture_decided(abort, cine, states, token)
+            finally:
+                if sent is None:                  # nothing sent (cancelled, state changed, or an error)
+                    self._release_capture(token)
 
         def failed(e):
-            self._capture_busy = False
+            self._release_capture(token)
             self.error.emit(f'Capture: cannot read the cine states: {describe_error(e)}')
         return self.tasks.submit(job, done, failed)
 
-    def _capture_decided(self, abort: bool, cine: int | None, states: dict):
+    def _release_capture(self, token):
+        if token is self._capture_token:
+            self._capture_token = None
+
+    def _capture_decided(self, abort: bool, cine: int | None, states: dict, token=None):
         """Act on a Capture/Abort press with the states just read. Returns the task that sends ``rec``, or
         None when nothing is sent."""
         session = self.session
@@ -563,7 +569,7 @@ class LiveTab(QWidget):
                     'lose that recording. Abort anyway?', ask, QMessageBox.StandardButton.No) \
                     != QMessageBox.StandardButton.Yes:
                 return None
-            return self._send_rec('Recording aborted (rec 0, back to preview)', lambda cam: cam.preview())
+            return self._send_rec('Recording aborted (rec 0, back to preview)', lambda cam: cam.preview(), token)
         if cine and 'STR' in flags(states.get(f'c{cine}')):
             if QMessageBox.warning(self, 'Erase the recording in this cine?',
                                    f'Cine {cine} holds a stored recording. Capture into cine {cine} ERASES it '
@@ -576,10 +582,11 @@ class LiveTab(QWidget):
             for k in [k for k in session.cine_info_cache if cine is None or k[0] == cine]:
                 del session.cine_info_cache[k]
             cam.record(cine)
-        return self._send_rec(f'Recording into cine {cine if cine else "(next free)"}; waiting for trigger', rec)
+        return self._send_rec(f'Recording into cine {cine if cine else "(next free)"}; waiting for trigger', rec,
+                              token)
 
-    def _send_rec(self, what: str, fn):
-        """Run a rec command; the Capture guard is released when it has gone (or failed)."""
+    def _send_rec(self, what: str, fn, token=None):
+        """Run a rec command; the press's Capture guard is released when it has gone (or failed)."""
         session = self.session
 
         def job(task):
@@ -587,13 +594,13 @@ class LiveTab(QWidget):
                 return fn(cam)
 
         def done(_):
-            self._capture_busy = False
+            self._release_capture(token)
             if session is self.session:
                 self.message.emit(what)
                 self.refresh()
 
         def failed(e):
-            self._capture_busy = False
+            self._release_capture(token)
             self.error.emit(f'{what.split(";")[0]} failed: {describe_error(e)}')
         return self.tasks.submit(job, done, failed)
 
