@@ -144,12 +144,14 @@ class ImageView(QWidget):
     display only. The display is rotate-then-flip: Flip H always mirrors left-right ON SCREEN.
     ``hovered(x, y)`` reports the pixel of the STORED array under the cursor (column, row; row 0 =
     top), or (-1, -1) outside the image. ``mode``: 'cursor' (crosshair), 'pan' (drag to move a
-    zoomed image), 'crop' (drag a rectangle: ``rect_drawn(x, y, w, h)``) or 'measure' (each left
-    click emits ``clicked(x, y)``). All of these are stored-array coordinates.
+    zoomed image), 'crop' (drag a rectangle: ``rect_drawn(x, y, w, h)``), 'roi' (the same drag for the
+    auto-trigger area: ``roi_drawn(x, y, w, h)``) or 'measure' (each left click emits ``clicked(x, y)``).
+    All of these are stored-array coordinates. ``roi`` is drawn as a yellow dotted box (PCC p.116).
     """
     hovered = Signal(int, int)
     clicked = Signal(int, int)
     rect_drawn = Signal(int, int, int, int)
+    roi_drawn = Signal(int, int, int, int)
     zoom_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None):
@@ -166,6 +168,7 @@ class ImageView(QWidget):
         self.offset = QPointF(0, 0)             # pan, in widget pixels, when zoomed
         self.show_cross = self.show_grid = False
         self.crop: tuple[int, int, int, int] | None = None     # outline, stored coordinates
+        self.roi: tuple[int, int, int, int] | None = None      # auto-trigger area outline, stored coordinates
         self.marks: list[tuple] = []            # measurement graphics: ('point', x, y) / ('line', x1, y1, x2, y2)
         self.mode = 'cursor'
         self._drag_from: QPointF | None = None
@@ -350,6 +353,10 @@ class ImageView(QWidget):
                 p.setPen(QPen(QColor(0, 200, 255), 1.5, Qt.PenStyle.DashLine))
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawRect(self.widget_rect(*rect))
+        if self.roi is not None:
+            p.setPen(QPen(QColor(255, 220, 0), 1.5, Qt.PenStyle.DotLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(self.widget_rect(*self.roi))
         if self.marks:
             p.setPen(QPen(QColor(230, 0, 230), 1.5))       # magenta, as PCC draws measurements (p.85)
             for m in self.marks:
@@ -367,7 +374,7 @@ class ImageView(QWidget):
             if self.mode == 'pan':
                 self._drag_from = event.position()
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            elif self.mode == 'crop':
+            elif self.mode in ('crop', 'roi'):
                 self._crop_from = self.image_coords(event.position())
             elif self.mode == 'measure':
                 xy = self.image_coords(event.position())
@@ -391,7 +398,7 @@ class ImageView(QWidget):
             self._crop_from = self._band = None
             self.update()
             if (rect[2], rect[3]) != (1, 1):        # a click without a drag draws nothing
-                self.rect_drawn.emit(*rect)
+                (self.roi_drawn if self.mode == 'roi' else self.rect_drawn).emit(*rect)
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event):

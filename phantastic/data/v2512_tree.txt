@@ -1,0 +1,12 @@
+# Phantom v2512 (firmware 23070) structures for the simulator's 'v2512' profile.
+# Variable NAMES and value TYPES are those a v2512 answered to 'get defc', 'get cam', 'get auto',
+# 'get meta' and 'get irig' (read only, 2026-10-07). The VALUES are neutral placeholders (0, 0.0, ""),
+# not that camera's settings, except irig.sec = 946684911 (2000-01-01 00:01:51 UTC: the clock read after
+# power-on, never set), which the simulator uses as its clock's starting point.
+# info.features was not part of that read: the list below is an assumption ('bref' lets the CSR path run).
+info : {features : "attach notify earlyimg bref"}
+defc : {res : 256 x 256, rate : 10000, exp : 90000, shoff : 0, edrexp : 0, ptframes : 200, bcount : 0, bperiod : 0, hqenable : 0, frcount : 1000, ramp : "", frsize : 0, decimation : 1, aexpmode : 0, aexpcomp : 0.0, meta : {ox : 0, oy : 0, w : 0, h : 0, ow : 0, oh : 0, crop : 0, resize : 0}}
+cam : {syncimg : 0, master : 0, tcmode : 0, trigpol : 0, trigfilt : 0, trigdelay : 0, frdelay : 0, startonacq : 0, memgateen : 0, rtoen : 0, membpp : 12, tsformat : 1, longready : 0, dark : 0, quiet : 0, tsetsns : 0, tsetcam : 0, apoffdis : 0, rtotfr : 0, cines : 4, battarm : 0, battmode : 0, armdelay : 0, wtrruntime : 0, prvruntime : 0, poffdelay : 0, readygate : 0, timezone : 0, rangefmt : 0, lang : "", occset : "", aux1mode : 0, aux2mode : 0, aux3mode : 0, aux4mode : 0, aux1pp : "", aux2pp : "", aux3pp : "", aux4pp : "", mode : 0}
+auto : {videoplay : 0, flashsave : 0, filesave : 0, acqrestart : 0, bref : 0, firstframe : 0, lastframe : 0, format : 0, loops : 0, speed : 0, progress : 0, bref_progress : 0, fseq : 0, trigger : {x : 0, y : 0, w : 64, h : 16, speed : 1, area : 10, threshold : 100, mode : 0}}
+meta : {name : "", lens : "", fstop : 0, flen : 0, comment : "", xset : ""}
+irig : {sec : 946684911, yearbegin : 946684800, flags : { NUL }, signal : "", gps : "", ranged : ""}

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import QVBoxLayout, QWidget
 
 from .. import protocol as P
 from ..cine import TIME64_SCALE, CineReader
+from ..defects import FLAG_P16, fill, flagged
 from ..measure import Measurement, px_per_unit
 from .imageview import (GAIN_RANGE, GAMMA_RANGE, IDENTITY_CURVE, TOE_RANGE, BRIGHTNESS_RANGE, ImageView,
                         auto_range, display_curve, focus_overlay, zebra_overlay)
@@ -261,6 +262,9 @@ class ImagePanel(QWidget):
         self.zebra_level: int | None = None      # None: the format's saturation level
         self.focus_assist = False
         self.readout_div, self.readout_bits = 1, None   # camera P16: show value / 16 on the 12-bit scale
+        self.flag_value: int | None = None    # live P16: pixels the camera flags (0xFF00) are filled ON SCREEN only
+        self._flag_mask: np.ndarray | None = None
+        self._flag_src = self._flag_filled = None
         self._crop: tuple[int, int, int, int] | None = None
         self.scale: float | None = None           # pixels per unit (PCC 'Calibrate', p.81), per panel
         self.unit = ''
@@ -282,12 +286,26 @@ class ImagePanel(QWidget):
     def title(self) -> str:
         return ''
 
+    def display_source(self) -> np.ndarray | None:
+        """What the screen is drawn from: ``frame``, or for live P16 a copy with the camera-flagged pixels
+        (exactly 0xFF00, isolated) replaced by PCC's 8-neighbour mean (:mod:`phantastic.defects`). ``frame``
+        itself, the readout and anything saved keep the raw values."""
+        f = self.frame
+        if f is None or self.flag_value is None or f.ndim != 2:
+            self._flag_mask = None
+            return f
+        if self._flag_src is not f:
+            self._flag_mask = flagged(f, self.flag_value)
+            self._flag_filled = fill(f, self._flag_mask) if self._flag_mask.any() else f
+            self._flag_src = f
+        return self._flag_filled
+
     def show_frame(self, raw: np.ndarray):
         resized = self.frame is None or self.frame.shape[:2] != raw.shape[:2]
         self.frame = raw
         if self._auto_next:
             self._auto_next = False
-            self.lo, self.hi = auto_range(raw)    # initial display range from the first frame (screen only)
+            self.lo, self.hi = auto_range(self.display_source())   # initial display range (screen only)
             self.display_changed.emit()
         if resized and self._crop is not None:
             self.set_crop_rect(self._crop)        # re-clamp to the new image size
@@ -313,6 +331,7 @@ class ImagePanel(QWidget):
         f = self.frame
         if f is None:
             return None
+        f = self.display_source()
         if self.curve_disabled:
             a8 = display_curve(f, 0, self.raw_max)
         else:
@@ -353,7 +372,7 @@ class ImagePanel(QWidget):
                                                             ('gamma', 'gain', 'brightness', 'toe'))
         self.curve_disabled = False
         if self.frame is not None:
-            self.lo, self.hi = auto_range(self.frame)
+            self.lo, self.hi = auto_range(self.display_source())
         self.render()
         self.display_changed.emit()
 
@@ -385,7 +404,7 @@ class ImagePanel(QWidget):
     def auto(self):
         """Fit the display range to THIS frame, 0.35 % saturated. Display only; data unchanged."""
         if self.frame is not None:
-            self.set_display_range(*auto_range(self.frame))
+            self.set_display_range(*auto_range(self.display_source()))
 
     def full(self):
         self.set_display_range(0, self.raw_max)
@@ -403,7 +422,7 @@ class ImagePanel(QWidget):
         if f is None or x < 0 or y < 0 or y >= f.shape[0] or x >= f.shape[1]:
             self.last_readout = None
         else:
-            v = f[y, x]
+            v = f[y, x]            # the raw value, also at a flagged pixel
             self.last_readout = (x, y, tuple(int(c) for c in v) if np.ndim(v) else int(v))
         self.readout_changed.emit()
 
@@ -415,9 +434,12 @@ class ImagePanel(QWidget):
         if isinstance(v, tuple):
             tag = f' ({self.readout_bits}-bit)' if self.readout_div != 1 else ''
             return 'RGB: ' + ','.join(format_scaled(c, self.readout_div) for c in v) + tag
+        x, y = self.last_readout[:2]
+        m = self._flag_mask
+        tag = ' flagged by camera' if m is not None and y < m.shape[0] and x < m.shape[1] and m[y, x] else ''
         if self.readout_div != 1:
-            return f'Value: {format_scaled(v, self.readout_div)} ({self.readout_bits}-bit)'
-        return f'Value: {v}'
+            return f'Value: {format_scaled(v, self.readout_div)} ({self.readout_bits}-bit){tag}'
+        return f'Value: {v}{tag}'
 
     # ------------------------------------------------------------------ crop rectangle (display only)
     def crop_rect(self) -> tuple[int, int, int, int] | None:
@@ -526,6 +548,8 @@ class PreviewPanel(ImagePanel):
         p16 = fmt == 'P16'
         self.raw_max = 65535 if p16 else 255
         self.readout_div, self.readout_bits = (1 << (16 - P16_SENSOR_BITS), P16_SENSOR_BITS) if p16 else (1, None)
+        self.flag_value = FLAG_P16 if p16 else None    # flags seen in corrected P16 only (phantastic.defects)
+        self._flag_src = None
         self._auto_next = True
         self.display_changed.emit()
 

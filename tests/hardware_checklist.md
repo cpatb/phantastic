@@ -34,5 +34,32 @@ step 6 passes. The `rec` command deletes the recording in the cine it records in
 9. **Decimation.** Download with `--step 10`. Every image must equal the corresponding
    image of step 6's full download, and the time stamps must match.
 
+## Camera settings (these steps change the camera state)
+
+Do steps 10 to 19 in the desktop app, with a scratch partition. Keep the session log
+(Help > Open log folder). The log records each `set` command and the value that the camera
+reads back. Before step 10, write down the PCC values of each setting that you change.
+
+10. **No write on connect.** Connect the camera. Open the session log. Make sure that it
+    contains only `get`, `attach`, `img`, `time` and `cstats` commands.
+11. **Read-back of each selector.** Open Camera Signals, Advanced Settings, Auto Exposure and
+    Image-Based Auto-Trigger. Compare each value with the value that PCC shows.
+12. **Leaf set.** In Camera Signals, change "Trigger filter". Click "Apply". The camera must
+    accept `set cam.trigfilt:<value>`. The field must show the read-back value. Set the PCC value again.
+13. **Value meanings.** Change one setting in PCC, for example the trigger edge. Disconnect
+    Phantastic and connect again. Record which number agrees with which PCC selection.
+14. **Struct set.** In Advanced Settings, change "Burst count" to 2. Click "Apply". The camera must
+    accept `set defc {bcount:2}` and keep its resolution and rate. Set "Burst count" to 0 again.
+15. **Text set.** In Cine Settings, write a "Name" and a "Description" with spaces. Click "Apply".
+    Record a cine and save it. PCC must show the name and the description in Cine Info.
+16. **Auto-trigger area.** Click "Draw on live image" and make a rectangle. Click "Apply". Look at
+    the area in PCC. Record if PCC shows the same rectangle. If not, the x and y convention is wrong.
+17. **CSR.** Cover the lens. Click "CSR". Record the progress values in the session log, and the
+    time until the camera reports the end of the CSR.
+18. **Set Time.** Click "Set Time..", then "Set". The camera clock must agree with the computer
+    clock to 2 s. Record if `irig.sec` is UTC or local time.
+19. **Flagged pixels in the live image.** Put the cursor on a pixel that the camera flags. The
+    status bar must show "flagged by camera" and the raw value.
+
 Record the results in `docs/HARDWARE_RESULTS.md` (camera model, firmware `info.swver`/`info.fver`,
 date, pass/fail per step).

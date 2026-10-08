@@ -262,6 +262,35 @@ def format_value(v) -> str:
     raise TypeError(f'cannot encode {type(v).__name__}')
 
 
+def set_line(name: str, value, sep: str = ':') -> str:
+    """The exact ``set`` command line for ``name`` = ``value``.
+
+    ``sep=':'`` gives ``set cam.timezone:18000``, the form the vendor SDK was captured sending for a
+    single variable (docs/captures); ``sep=' '`` gives ``set defc {...}``, the form Phantastic's
+    ``configure`` has always sent (and that a v2512 accepted, 2026-10-07).
+    """
+    if sep not in (':', ' '):
+        raise ValueError(f'separator must be ":" or " ", not {sep!r}')
+    return f'set {name}{sep}{_set_value(value)}'
+
+
+def _set_value(v) -> str:
+    """Like :func:`format_value`, but a string is ALWAYS quoted (a bare ``123`` would read as a number)
+    and a float is written without an exponent (``1e-05`` -> ``0.00001``; exponent syntax on input is
+    not established for the camera)."""
+    if isinstance(v, str):
+        bad = [c for c in v if ord(c) < 0x20 or ord(c) == 0x7F]
+        if bad:      # a line break would end the command; how the camera escapes them is not known
+            raise ValueError(f'control character {bad[0]!r} cannot be sent in a set command')
+        return '"' + v.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    if isinstance(v, (float, np.floating)):
+        r = repr(float(v))          # what configure has always sent (20000.0); only an exponent form changes
+        return np.format_float_positional(float(v), trim='-') if 'e' in r or 'E' in r else r
+    if isinstance(v, dict):
+        return '{' + ', '.join(f'{k}:{_set_value(x)}' for k, x in v.items()) + '}'
+    return format_value(v)
+
+
 def format_number(fmt) -> str:
     """Normalise an image format token or number to its token."""
     if isinstance(fmt, int):

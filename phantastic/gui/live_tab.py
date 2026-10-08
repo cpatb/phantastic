@@ -11,14 +11,23 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QMessageBox, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout,
+                               QGroupBox, QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton, QScrollArea,
+                               QSpinBox, QVBoxLayout, QWidget)
 
+from .. import camsettings as CS
 from .. import protocol as P
+from .camera_settings import SetTimeDialog, SettingsController, SettingsForm, format_clock, pc_timezone_west
 from .dialogs import SaveCineDialog
 from ..naming import DEFAULT_CINE_TEMPLATE
 from .widgets import GREEN, RED, CollapsibleSection, TriggerBar, big_button
 from .workers import CameraSession, TaskManager, describe_error
+
+CSR_TIMEOUT_S = 60.0     # give up waiting for auto.bref_progress after this long (a guess: CSR length is not documented)
+
+
+def _keys(section: str) -> list[str]:
+    return [s.key for s in CS.SETTINGS if s.section == section]
 
 REFRESH_INTERVAL_MS = 1000
 NS_PER_US = 1000
@@ -56,6 +65,8 @@ class LiveTab(QWidget):
     error = Signal(str)
     cines_changed = Signal()
     recording_changed = Signal(bool)
+    roi_draw_requested = Signal()          # user wants to drag the auto-trigger area on the live image
+    roi_overlay_changed = Signal(object)   # (x, y, w, h) in stored live-image pixels, or None
 
     def __init__(self, tasks: TaskManager, parent: QWidget | None = None):
         super().__init__(parent)
@@ -68,23 +79,50 @@ class LiveTab(QWidget):
         self.recording = False
         self._refresh_busy = False
         self.dialogs: list[SaveCineDialog] = []
+        self.bref_available = False
+        self.last_csr: dict | None = None
+        self._capture_token: object | None = None     # set while one Capture/Abort press is in flight
 
         # -- top: Camera:
         self.camera_combo = QComboBox()
         self.camera_combo.setToolTip('Connected camera (connect one in the Manager tab).')
 
         # -- Camera Settings
+        self.settings = SettingsController(tasks, self)
+        self.settings.message.connect(self.message)
+        self.settings.error.connect(self.error)
         self.time_label = QLabel('-')
-        self.time_label.setToolTip('Computer clock. Phantastic neither reads nor sets the camera clock.')
+        self.time_label.setToolTip('Computer clock.')
+        self.camclock_label = QLabel('-', wordWrap=True)
+        self.camclock_label.setToolTip('irig.sec as last read, advanced by the computer clock since. Shown as UTC: '
+                                       'whether the camera keeps UTC or local time is not verified.')
+        self.settime_btn = QPushButton('Set Time..')
+        self.settime_btn.setToolTip('Set the camera clock to the computer clock (PCC p.30-32). Asks first: it '
+                                    'changes the time stamps of every later recording.')
+        self.settime_btn.clicked.connect(self.set_time)
         self.bitdepth_label = QLabel('-')
         self.bitdepth_label.setToolTip('cam.membpp, read only')
         self.partition_combo = QComboBox()
         self.partition_combo.setToolTip('Number of memory partitions (cines). Changing it ERASES ALL cines.')
         self.partition_combo.activated.connect(self._partition_chosen)
+        self.backup_load_btn = QPushButton('Load...')
+        self.backup_load_btn.setToolTip('Load settings saved by Phantastic: they appear as pending changes in each '
+                                        'selector; nothing is sent until you press that selector\'s Apply.')
+        self.backup_load_btn.clicked.connect(lambda: self.load_backup())
+        self.backup_save_btn = QPushButton('Save...')
+        self.backup_save_btn.setToolTip('Read the camera settings shown in these selectors and save them to a JSON '
+                                        'file on this computer (PCC p.31-32; the camera\'s memory slots are not used).')
+        self.backup_save_btn.clicked.connect(lambda: self.save_backup())
+        self.backup_label = QLabel('', wordWrap=True)
+        self.backup_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         cs = QWidget()
         f = QFormLayout(cs)
         f.setContentsMargins(6, 4, 4, 4)
-        f.addRow('Current Time:', self.time_label)
+        trow = QHBoxLayout()
+        trow.addWidget(self.time_label, 1)
+        trow.addWidget(self.settime_btn)
+        f.addRow('Current Time:', trow)
+        f.addRow('Camera clock:', self.camclock_label)
         row = QHBoxLayout()
         row.addWidget(QLabel('Bit Depth'))
         row.addWidget(self.bitdepth_label)
@@ -93,7 +131,26 @@ class LiveTab(QWidget):
         row.addWidget(self.partition_combo)
         row.addStretch(1)
         f.addRow(row)
+        brow = QHBoxLayout()
+        brow.addWidget(QLabel('Backup & restore settings'))
+        brow.addStretch(1)
+        brow.addWidget(self.backup_load_btn)
+        brow.addWidget(self.backup_save_btn)
+        f.addRow(brow)
+        f.addRow(self.backup_label)
         self.camera_settings = CollapsibleSection('Camera Settings', cs)
+
+        # -- forms for the settings in phantastic.camsettings (one Apply each)
+        self.meta_form = SettingsForm(_keys(CS.CINE_META))
+        self.cine_adv_form = SettingsForm(_keys(CS.CINE_ADV))
+        self.adv_form = SettingsForm(_keys(CS.ADVANCED))
+        self.signals_form = SettingsForm(_keys(CS.SIGNALS))
+        self.aexp_form = SettingsForm(_keys(CS.AUTO_EXP))
+        self.ibat_form = SettingsForm(_keys(CS.IBAT))
+        self.forms = (self.meta_form, self.cine_adv_form, self.adv_form, self.signals_form, self.aexp_form,
+                      self.ibat_form)
+        for form in self.forms:
+            self.settings.add_form(form)
 
         # -- Cine Settings
         self.cine_combo = QComboBox()
@@ -110,6 +167,10 @@ class LiveTab(QWidget):
         self.edr_spin.setToolTip('Extreme Dynamic Range exposure, µs (0 = off); sent in ns.')
         self.csr_btn = QPushButton('CSR')
         self.csr_btn.clicked.connect(self.csr)
+        self.csr_progress = QProgressBar()
+        self.csr_progress.setRange(0, 100)
+        self.csr_progress.setVisible(False)
+        self.csr_progress.setToolTip('auto.bref_progress, read as percent (an assumption; not verified on hardware)')
         self.apply_btn = QPushButton('Apply')
         self.apply_btn.setToolTip('Send Resolution, Sample Rate, Exposure, EDR and Last to the camera and read '
                                   'back what it accepted.')
@@ -129,8 +190,16 @@ class LiveTab(QWidget):
         g.setColumnStretch(1, 1)
         btns = QHBoxLayout()
         btns.addWidget(self.csr_btn)
+        btns.addWidget(self.csr_progress, 1)
         btns.addStretch(1)
         btns.addWidget(self.apply_btn)
+        self.apply_preview = QLabel('', wordWrap=True)
+        self.apply_preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.apply_preview.setStyleSheet('QLabel { color: #404040; font-family: Consolas, monospace; }')
+        for sig in (self.res_combo.currentTextChanged, self.rate_combo.currentTextChanged):
+            sig.connect(lambda _: self._update_apply_preview())
+        for spin in (self.exp_spin, self.edr_spin):
+            spin.valueChanged.connect(lambda _: self._update_apply_preview())
 
         # Image Range and Trigger Position (p.35)
         self.pre_label = QLabel('-')
@@ -140,6 +209,7 @@ class LiveTab(QWidget):
         self.duration_label = QLabel('Duration: -')
         self.pretrig_label = QLabel('Pretrigger Time: -')
         self.pt_spin.valueChanged.connect(self._update_range)
+        self.pt_spin.valueChanged.connect(lambda _: self._update_apply_preview())
         self.rate_combo.currentTextChanged.connect(lambda _: self._update_range())
         self.trigger_bar.post_changed.connect(self.pt_spin.setValue)
         gr = QGroupBox('Image Range and Trigger Position')
@@ -159,11 +229,51 @@ class LiveTab(QWidget):
         cine_w = QWidget()
         v = QVBoxLayout(cine_w)
         v.setContentsMargins(6, 4, 4, 4)
+        v.addWidget(self.meta_form)          # Name / Description (PCC p.33), applied on their own
         v.addLayout(g)
         v.addLayout(btns)
+        v.addWidget(self.apply_preview)
         v.addWidget(gr)
         v.addWidget(self.readback_label)
         self.cine_settings = CollapsibleSection('Cine Settings', cine_w, expanded=True)
+
+        # -- Advanced Settings (p.47-49): Cine Advanced (burst, shutter offset; sent with configure) first
+        adv = QWidget()
+        v = QVBoxLayout(adv)
+        v.setContentsMargins(6, 4, 4, 4)
+        v.addWidget(QLabel('<b>Cine Advanced</b>'))
+        v.addWidget(self.cine_adv_form)
+        v.addWidget(QLabel('<b>Recording actions, sync, start-up, fans, time code</b>'))
+        v.addWidget(self.adv_form)
+        self.advanced_settings = CollapsibleSection('Advanced Settings', adv)
+        self.camera_signals = CollapsibleSection('Camera Signals', self._padded(self.signals_form))
+        self.auto_exposure = CollapsibleSection('Auto Exposure', self._padded(self.aexp_form))
+
+        # -- Image-Based Auto-Trigger (p.115-117): fields, plus the area drawn on / shown on the live image
+        self.roi_draw_btn = QPushButton('Draw on live image')
+        self.roi_draw_btn.setToolTip('Drag a rectangle on the live image; it fills x, y, w, h here (not sent until '
+                                     f'Apply). Coordinate convention: {CS.ROI_CONVENTION}.')
+        self.roi_draw_btn.clicked.connect(self.roi_draw_requested)
+        self.roi_show_check = QCheckBox('Show on image')
+        self.roi_show_check.setToolTip('Yellow dotted box on the live image (screen only). '
+                                       f'Convention: {CS.ROI_CONVENTION}.')
+        self.roi_show_check.toggled.connect(lambda _: self._emit_roi())
+        self.ibat_form.edited.connect(self._emit_roi)
+        self.settings.updated.connect(self._emit_roi)
+        ib = QWidget()
+        v = QVBoxLayout(ib)
+        v.setContentsMargins(6, 4, 4, 4)
+        v.addWidget(self.ibat_form)
+        r = QHBoxLayout()
+        r.addWidget(self.roi_draw_btn)
+        r.addWidget(self.roi_show_check)
+        r.addStretch(1)
+        v.addLayout(r)
+        note = QLabel(f'Region x, y: {CS.ROI_CONVENTION}. PCC p.117: never rely on it where a missed or '
+                      'false trigger could cause harm.', wordWrap=True)
+        note.setStyleSheet('QLabel { color: #606060; }')
+        v.addWidget(note)
+        self.auto_trigger = CollapsibleSection('Image-Based Auto-Trigger', ib)
 
         # -- Camera Info (p.38)
         self.info_labels = {k: QLabel('-') for k in ('name', 'serial', 'ip', 'hwver', 'firmware', 'ram', 'cinemem')}
@@ -181,7 +291,9 @@ class LiveTab(QWidget):
         bv = QVBoxLayout(body)
         bv.setContentsMargins(0, 0, 0, 0)
         bv.setSpacing(1)
-        for s in (self.camera_settings, self.cine_settings, self.camera_info):
+        self.sections = (self.camera_settings, self.cine_settings, self.advanced_settings, self.camera_signals,
+                         self.auto_exposure, self.auto_trigger, self.camera_info)     # PCC's order (p.30)
+        for s in self.sections:
             bv.addWidget(s)
         bv.addStretch(1)
         scroll = QScrollArea()
@@ -214,9 +326,22 @@ class LiveTab(QWidget):
         self.timer.timeout.connect(self.refresh)
         self.clock = QTimer(self)
         self.clock.setInterval(1000)
-        self.clock.timeout.connect(lambda: self.time_label.setText(time.strftime('%a %b %d %Y %H:%M:%S')))
+        self.clock.timeout.connect(self._tick_clock)
+        self.settings.updated.connect(self._tick_clock)
         self.clock.start()
         self.set_session(None)
+
+    @staticmethod
+    def _padded(w: QWidget) -> QWidget:
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(6, 4, 4, 4)
+        v.addWidget(w)
+        return box
+
+    def _tick_clock(self):
+        self.time_label.setText(time.strftime('%a %b %d %Y %H:%M:%S'))
+        self.camclock_label.setText(format_clock(self.settings.camera_clock()) if self.session is not None else '-')
 
     # ------------------------------------------------------------------ session
     def set_session(self, session: CameraSession | None, acquisition: dict | None = None):
@@ -227,12 +352,17 @@ class LiveTab(QWidget):
         self.camera_combo.clear()
         self.cine_combo.clear()
         self.partition_combo.clear()
-        for w in (self.camera_settings, self.cine_settings, self.camera_info, self.capture_btn, self.camera_combo):
+        for w in self.sections + (self.capture_btn, self.camera_combo):
             w.setEnabled(session is not None)
         self.trigger_btn.setEnabled(False)
         self.capture_btn.setText('Capture')
+        self._capture_token = None
+        self.backup_label.setText('')
+        self.csr_progress.setVisible(False)
+        self.settings.set_session(session)      # reads with 'get' only; nothing is written on connect
         if session is None:
             self.timer.stop()
+            self.apply_preview.setText('')
             for lab in self.info_labels.values():
                 lab.setText('-')
             self.bitdepth_label.setText('-')
@@ -259,6 +389,7 @@ class LiveTab(QWidget):
         for n in range(1, maxparts + 1):
             self.partition_combo.addItem(str(n), n)
         bref = 'bref' in str(info.get('features', '')).split()
+        self.bref_available = bref
         self.csr_btn.setEnabled(bref)
         self.csr_btn.setToolTip('Current Session Reference (black reference, "bref"): cover the lens first.' if bref
                                 else 'This camera does not list the "bref" feature, so CSR is not available.')
@@ -282,6 +413,18 @@ class LiveTab(QWidget):
         if d.get('ptframes') is not None:
             self.pt_spin.setValue(int(d['ptframes']))
         self._update_range()
+        self._update_apply_preview()
+
+    def _update_apply_preview(self):
+        """The exact line Cine Settings' Apply will send (it always sends these five fields)."""
+        from ..camera import acquisition_update
+        if self.session is None:
+            return
+        try:
+            self.apply_preview.setText('Apply will send:\n' + P.set_line('defc', acquisition_update(
+                **self.requested_settings()), ' '))
+        except ValueError as e:
+            self.apply_preview.setText(f'Cannot apply: {e}')
 
     def _update_range(self):
         """Duration and pretrigger lines from frcount, post-trigger frames and the sample rate (p.35)."""
@@ -356,6 +499,7 @@ class LiveTab(QWidget):
             exp_txt = f'{int(exp) / NS_PER_US:g} µs ({int(exp)} ns)' if exp is not None else '-'
             self.readback_label.setText(f'Camera accepted: {_fmt(d.get("res"))}, {_fmt(d.get("rate"))} fps, '
                                         f'exposure {exp_txt}, {_fmt(d.get("ptframes"))} post-trigger frames')
+            self.settings.read()     # 'get' only: the auto-trigger area is converted with the new resolution
         return self._run('Settings applied', lambda cam: cam.configure(**req), show)
 
     def selected_cine(self) -> int | None:
@@ -367,18 +511,110 @@ class LiveTab(QWidget):
         self.cine_combo.setCurrentIndex(max(0, self.cine_combo.findData(cine or 0)))
 
     def capture(self):
-        """Capture, or Abort Recording (``rec 0``) while recording."""
-        if self.recording:
-            return self._run('Recording aborted (rec 0, back to preview)', lambda cam: cam.preview())
-        cine = self.selected_cine()
+        """Capture, or Abort Recording (``rec 0``) while recording.
+
+        The cine states are read fresh (``cstats``) before anything is sent: Capture into a cine holding a
+        stored recording, or Abort while a triggered recording is still filling, asks first. Capture into an
+        empty cine or the next free one, and Abort while only waiting for a trigger, erase no recording and
+        do not ask."""
         session = self.session
+        if session is None:
+            self.error.emit('Not connected')
+            return None
+        if self._capture_token is not None:   # one Capture/Abort at a time: a second press must not send a 2nd rec
+            return None
+        token = self._capture_token = object()   # released only by THIS press's callbacks
+        abort, cine = self.recording, self.selected_cine()
+
+        def job(task):
+            with session.use() as cam:
+                return cam.cine_states()
+
+        def done(states):
+            sent = None
+            try:
+                if session is self.session and token is self._capture_token:
+                    self.cine_states = states
+                    self._update_cines()
+                    sent = self._capture_decided(abort, cine, states, token)
+            finally:
+                if sent is None:                  # nothing sent (cancelled, state changed, or an error)
+                    self._release_capture(token)
+
+        def failed(e):
+            self._release_capture(token)
+            self.error.emit(f'Capture: cannot read the cine states: {describe_error(e)}')
+        return self.tasks.submit(job, done, failed)
+
+    def _release_capture(self, token):
+        if token is self._capture_token:
+            self._capture_token = None
+
+    def _capture_decided(self, abort: bool, cine: int | None, states: dict, token=None):
+        """Act on a Capture/Abort press with the states just read. Returns the task that sends ``rec``, or
+        None when nothing is sent."""
+        session = self.session
+        ask = QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        if is_recording(states) != abort:
+            # the button was pressed as Capture while the camera records (or as Abort while it does not):
+            # do not act on a stale label; the button now shows the real state
+            self.error.emit('The camera ' + ('is recording' if not abort else 'is no longer recording')
+                            + '; nothing was sent. Check the cine states and press again.')
+            return None
+        if abort:
+            filling = [k for k, st in states.items() if int(k[1:]) >= 1 and 'TRG' in flags(st) and 'STR' not in flags(st)]
+            if filling and QMessageBox.warning(
+                    self, 'Abort a triggered recording?',
+                    f'{", ".join(filling)} was triggered and is still recording post-trigger images. Abort (rec 0) may '
+                    'lose that recording. Abort anyway?', ask, QMessageBox.StandardButton.No) \
+                    != QMessageBox.StandardButton.Yes:
+                return None
+            if not self._still_current(session, token):
+                return None
+            return self._send_rec('Recording aborted (rec 0, back to preview)', lambda cam: cam.preview(), token)
+        if cine and 'STR' in flags(states.get(f'c{cine}')):
+            if QMessageBox.warning(self, 'Erase the recording in this cine?',
+                                   f'Cine {cine} holds a stored recording. Capture into cine {cine} ERASES it '
+                                   '(save it first if you need it). Record into it anyway?',
+                                   ask, QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return None
 
         def rec(cam):
             # a re-recorded cine must not be described by the details of its previous recording
             for k in [k for k in session.cine_info_cache if cine is None or k[0] == cine]:
                 del session.cine_info_cache[k]
             cam.record(cine)
-        return self._run(f'Recording into cine {cine if cine else "(next free)"}; waiting for trigger', rec)
+        if not self._still_current(session, token):
+            return None
+        return self._send_rec(f'Recording into cine {cine if cine else "(next free)"}; waiting for trigger', rec,
+                              token)
+
+    def _still_current(self, session, token) -> bool:
+        """After a modal question: is this still the camera whose states were read, and this press's turn?
+        (A dialog runs its own event loop, so a disconnect or reconnect can happen while it is open.)"""
+        ok = self.session is session and (token is None or self._capture_token is token)
+        if not ok:
+            self.error.emit('The camera connection changed while the question was open; nothing was sent.')
+        return ok
+
+    def _send_rec(self, what: str, fn, token=None):
+        """Run a rec command; the press's Capture guard is released when it has gone (or failed)."""
+        session = self.session
+
+        def job(task):
+            with session.use() as cam:
+                return fn(cam)
+
+        def done(_):
+            self._release_capture(token)
+            if session is self.session:
+                self.message.emit(what)
+                self.refresh()
+
+        def failed(e):
+            self._release_capture(token)
+            self.error.emit(f'{what.split(";")[0]} failed: {describe_error(e)}')
+        return self.tasks.submit(job, done, failed)
 
     def trigger(self):
         if not self.trigger_btn.isEnabled():
@@ -389,13 +625,183 @@ class LiveTab(QWidget):
         return self._run('Preview (rec 0)', lambda cam: cam.preview())
 
     def csr(self):
-        if self.session is None or not self.csr_btn.isEnabled():
-            return
-        if QMessageBox.question(self, 'CSR', 'Cover the lens, then OK.',
+        """CSR (PCC p.34): confirm, send ``bref``, then follow ``auto.bref_progress`` on a progress bar."""
+        session = self.session
+        if session is None or not self.csr_btn.isEnabled():
+            return None
+        text = ('Cover the lens: the sensor must be dark (PCC p.34). The camera then takes a new black reference '
+                'for the current settings, replacing the one it holds. Continue?')
+        if self.settings.current.get('auto.trigger.mode'):
+            text += ('\n\nImage-Based Auto-Trigger is enabled (auto.trigger.mode = '
+                     f'{self.settings.current["auto.trigger.mode"]}); PCC p.34 says to disable it before a CSR.')
+        if QMessageBox.question(self, 'CSR', text,
                                 QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel) \
                 != QMessageBox.StandardButton.Ok:
+            return None
+        self.csr_btn.setEnabled(False)
+        self.csr_progress.setValue(0)
+        self.csr_progress.setVisible(True)
+
+        def job(task):
+            with session.use() as cam:
+                try:
+                    cam.get('auto.bref_progress')
+                    has_progress = True
+                except P.ProtocolError:
+                    has_progress = False
+                if not has_progress:
+                    cam.command('bref')
+                    return dict(confirmed=False, reason='this camera does not report auto.bref_progress; '
+                                                        'completion not confirmed')
+                return cam.black_reference(progress=task.progress, timeout=CSR_TIMEOUT_S)
+
+        def finish():
+            self.csr_btn.setEnabled(session is self.session and self.bref_available)
+            self.csr_progress.setVisible(False)
+
+        def done(r):
+            finish()
+            if session is not self.session:
+                return
+            self.last_csr = r
+            if r['confirmed']:
+                self.message.emit(f'CSR done ({r["reason"]})')
+            else:
+                self.error.emit(f'CSR sent; {r["reason"]}')
+
+        def failed(e):
+            finish()
+            self.error.emit(f'CSR failed: {describe_error(e)}')
+        return self.tasks.submit(job, done, failed, lambda d, t: self.csr_progress.setValue(d))
+
+    # ------------------------------------------------------------------ clock (PCC p.30-32)
+    def set_time(self):
+        """Set Time..: a dialog states what changes; only its Set button sends ``setrtc``."""
+        session = self.session
+        if session is None:
+            return None
+        dlg = SetTimeDialog(self.settings.camera_clock(), 'timezone' in self.settings.structs.get('cam', {}), self)
+        self._set_time_dialog = dlg
+        if dlg.exec() != QDialog.DialogCode.Accepted or not self._still_current(session, None):
+            return None
+        return self.send_time(dlg.with_timezone)
+
+    def send_time(self, with_timezone: bool):
+        """Send the PC clock (``setrtc``, and ``set cam.timezone`` if asked), then re-read. Called only after
+        the Set Time dialog was accepted."""
+        session = self.session
+        if session is None:
+            return None
+        tz = pc_timezone_west()
+
+        def job(task):
+            with session.use() as cam:
+                cam.set_clock(int(time.time()))
+                if with_timezone:
+                    cam.set('cam.timezone', tz)
+                return CS.read_settings(cam)
+
+        def done(r):
+            if session is self.session:
+                self.settings._push(*r)
+                self.message.emit(f'Camera clock set: {format_clock(self.settings.camera_clock())}'
+                                  + (f'; cam.timezone = {r[1].get("cam", {}).get("timezone")}' if with_timezone else ''))
+
+        def failed(e):
+            self.error.emit(f'Set Time failed: {describe_error(e)}')
+        return self.tasks.submit(job, done, failed)
+
+    # ------------------------------------------------------------------ backup & restore (PCC p.31-32)
+    def save_backup(self, path: str | None = None):
+        """Re-read the camera (``get`` only) and save its settings to a JSON file on this computer."""
+        session = self.session
+        if session is None:
+            return None
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(self, 'Save camera settings',
+                                                  f'phantastic_settings_{session.info.get("serial")}.json',
+                                                  'Phantastic settings (*.json)')
+            if not path:
+                return None
+
+        def job(task):
+            with session.use() as cam:
+                cur, structs = CS.read_settings(cam)
+            CS.save_backup(path, cur, session.info)
+            return cur, structs
+
+        def done(r):
+            if session is self.session:
+                self.settings._push(*r)
+                self.backup_label.setText(f'Saved {len(r[0])} settings to {path}')
+                self.message.emit(f'Camera settings saved to {path}')
+
+        def failed(e):
+            self.error.emit(f'Saving camera settings failed: {describe_error(e)}')
+        return self.tasks.submit(job, done, failed)
+
+    def load_backup(self, path: str | None = None):
+        """Show a saved file's differences from the camera as pending edits. NOTHING is sent: each selector's
+        Apply sends its own part. Returns (wanted, notes) or None."""
+        if self.session is None:
+            return None
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(self, 'Load camera settings', '', 'Phantastic settings (*.json)')
+            if not path:
+                return None
+        try:
+            saved = CS.load_backup(path)
+        except (OSError, ValueError) as e:
+            self.error.emit(f'Cannot load camera settings: {e}')
+            return None
+        cur = self.settings.current
+        wanted, notes = CS.backup_diff(cur, saved['settings'])
+        for form in self.forms:
+            form.set_wanted(wanted)
+        cam = saved.get('camera') or {}
+        lines = [f'{k}: camera {CS.display(cur[k])} -> file {CS.display(v)}' for k, v in wanted.items()]
+        self.backup_label.setText(
+            f'{Path(path).name} (saved {saved.get("saved")}, serial {cam.get("serial")}): '
+            + (f'{len(wanted)} difference(s), shown as pending in the selectors below; NOT sent until you press '
+               'Apply there.\n' + '\n'.join(lines) if wanted else 'no differences from the camera.')
+            + ('\n' + '\n'.join(notes) if notes else ''))
+        return wanted, notes
+
+    # ------------------------------------------------------------------ auto-trigger area on the live image
+    def _ibat_value(self, k: str) -> int | None:
+        """auto.trigger.<k> as currently in the field (pending edits included), else as read."""
+        key = f'auto.trigger.{k}'
+        w = self.ibat_form.fields[key]
+        try:
+            return CS.parse(CS.BY_KEY[key], w.text())
+        except ValueError:
+            v = self.settings.current.get(key)
+            return v if isinstance(v, int) else None
+
+    def _live_size(self) -> tuple[int, int] | None:
+        res = self.settings.structs.get('defc', {}).get('res')
+        return (res.width, res.height) if isinstance(res, P.Resolution) else None
+
+    def ibat_rect(self) -> tuple[int, int, int, int] | None:
+        """The auto-trigger area in stored live-image pixels (left, top, w, h), by CS.ROI_CONVENTION."""
+        size = self._live_size()
+        vals = [self._ibat_value(k) for k in 'xywh']
+        if size is None or None in vals or not all(k in self.settings.current for k in
+                                                   ('auto.trigger.x', 'auto.trigger.y', 'auto.trigger.w',
+                                                    'auto.trigger.h')):
+            return None
+        return CS.roi_from_camera(*vals, *size)
+
+    def set_ibat_rect(self, rect):
+        """A rectangle drawn on the live image -> the x, y, w, h fields (pending; sent only by Apply)."""
+        size = self._live_size()
+        if size is None or rect is None:
             return
-        self._run('CSR (black reference) done', lambda cam: cam.command('bref'))
+        x, y, w, h = CS.roi_to_camera(*rect, *size)
+        self.ibat_form.set_wanted({'auto.trigger.x': x, 'auto.trigger.y': y, 'auto.trigger.w': w, 'auto.trigger.h': h})
+
+    def _emit_roi(self):
+        self.roi_overlay_changed.emit(self.ibat_rect() if self.roi_show_check.isChecked() else None)
 
     def _partition_chosen(self, index: int):
         n = self.partition_combo.itemData(index)
