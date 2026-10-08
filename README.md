@@ -46,6 +46,13 @@ Simulated Camera) to try it without a camera. In the Play tab a cine still in ca
 marked with `[` / `]` and saved; Image Tools (Ctrl+I) changes the display only, never the recorded values.
 First time with a camera: [docs/TEST_TODAY.md](docs/TEST_TODAY.md).
 
+Camera settings in the Live tab (Camera Signals, Advanced Settings with burst, Auto Exposure, Image-Based
+Auto-Trigger, cine Name/Description, Set Time, CSR with progress, settings backup to a JSON file): a field
+appears only for a variable the connected camera reports, each selector lists the exact `set` lines its
+Apply will send, and only changed fields are sent and then read back. Where PCC's manual does not say what
+a number means, the value is shown raw and labelled so. Set Time, CSR and recording into a cine that holds
+a recording ask first. These writes are not yet checked on a camera: `tests/hardware_checklist.md` steps 10-19.
+
 Display tools (screen only; recorded values, saved files and the camera are never changed):
 
 * Image Tools: black/white window, Gain, Brightness, Gamma and Toe (`display_curve` in
