@@ -63,6 +63,8 @@ class MainWindow(QMainWindow):
         self.tasks = TaskManager(on_error=lambda e: self.report_error(describe_error(e)), parent=self)
         self.session: CameraSession | None = None
         self.simulator: Simulator | None = None
+        self.simulator_profile: str | None = None   # e.g. 'v2512': the simulated camera answers that model's variables
+        self._roi_overlay: tuple | None = None
         self.last_error: str | None = None
         self._connecting = False
         self.preview: PreviewPanel | None = None
@@ -246,6 +248,8 @@ class MainWindow(QMainWindow):
         live.error.connect(self.report_error)
         live.cines_changed.connect(self._cines_changed)
         live.recording_changed.connect(lambda on: self.preview and self.preview.set_recording(on))
+        live.roi_draw_requested.connect(self.draw_trigger_area)
+        live.roi_overlay_changed.connect(self._show_trigger_area)
         play.cine_chosen.connect(self._play_chosen)
         play.save_requested.connect(self._save_requested)
 
@@ -375,8 +379,33 @@ class MainWindow(QMainWindow):
             return self.preview
         self.preview = PreviewPanel(self.tasks, self.session)
         self.preview.set_recording(self.live_tab.recording)
+        self.preview.view.roi_drawn.connect(self._trigger_area_drawn)
+        self.preview.view.roi = self._roi_overlay
         self._add_panel(self.preview)
         return self.preview
+
+    # ------------------------------------------------------------------ auto-trigger area (PCC p.115-117)
+    def draw_trigger_area(self):
+        """Image-Based Auto-Trigger 'Draw on live image': the next drag on the live panel sets the area fields."""
+        p = self.open_preview()
+        if p is None:
+            self.report_error('Connect to a camera first')
+            return
+        p.view.set_mode('roi')
+        self.report('Drag the auto-trigger area on the live image (fills x, y, w, h; nothing is sent until Apply)')
+
+    def _trigger_area_drawn(self, x: int, y: int, w: int, h: int):
+        self.live_tab.set_ibat_rect((x, y, w, h))
+        if self.preview is not None:
+            self.preview.view.set_mode(self.view_mode)       # back to the tool chosen on the tool strip
+        self.report(f'Auto-trigger area {w} x {h} at {x},{y} (image pixels) entered; press Apply in '
+                    'Image-Based Auto-Trigger to send it')
+
+    def _show_trigger_area(self, rect):
+        self._roi_overlay = rect
+        if self.preview is not None:
+            self.preview.view.roi = rect
+            self.preview.view.update()
 
     def open_playback(self, source) -> PlaybackPanel:
         sub = self.playbacks.get(source.key)
@@ -597,7 +626,9 @@ class MainWindow(QMainWindow):
         """Add Simulated Camera: start the built-in simulator on 127.0.0.1 (free ports) and connect."""
         if self.simulator is None:
             try:
-                self.simulator = Simulator('127.0.0.1', 0, discovery_port=0, attach_port=0).start()
+                from ..simulator import CameraModel
+                self.simulator = Simulator('127.0.0.1', 0, discovery_port=0, attach_port=0,
+                                           model=CameraModel(profile=self.simulator_profile)).start()
             except OSError as e:
                 self.report_error(f'Could not start the simulator: {e}')
                 return
