@@ -315,3 +315,27 @@ def test_multiline_text_cannot_be_applied(win):
     form = win.live_tab.meta_form
     edit(form, 'meta.comment', 'line 1\nline 2')
     assert not form.apply_btn.isEnabled() and 'control characters' in form.preview.text()
+
+
+def test_double_capture_sends_one_rec(win):
+    live = win.live_tab
+    wait_until(lambda: live.cine_combo.findData(1) >= 0, what='cine list')
+    live.select_cine(1)
+    n = len(win.simulator.model.received)
+    live.capture()
+    live.capture()                     # a second press while the first is in flight (review finding)
+    wait_until(lambda: 'rec 1' in win.simulator.model.received[n:], what='rec 1')
+    settle(0.5)
+    assert win.simulator.model.received[n:].count('rec 1') == 1
+
+
+def test_stale_button_label_sends_nothing(win):
+    from phantastic import protocol as P
+    live = win.live_tab
+    errors = []
+    live.error.connect(errors.append)
+    n = len(win.simulator.model.received)
+    # pressed as Capture (abort False) while the fresh states show a triggered cine still filling
+    assert live._capture_decided(False, 2, {'c1': P.Flags(('TRG', 'DEF', 'ACT')), 'c2': P.Flags(('RDY',))}) is None
+    settle()
+    assert writes(win, n) == [] and 'nothing was sent' in errors[-1]
