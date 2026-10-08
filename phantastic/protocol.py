@@ -271,7 +271,21 @@ def set_line(name: str, value, sep: str = ':') -> str:
     """
     if sep not in (':', ' '):
         raise ValueError(f'separator must be ":" or " ", not {sep!r}')
-    return f'set {name}{sep}{format_value(value)}'
+    return f'set {name}{sep}{_set_value(value)}'
+
+
+def _set_value(v) -> str:
+    """Like :func:`format_value`, but a string is ALWAYS quoted (a bare ``123`` would read as a number)
+    and a float is written without an exponent (``1e-05`` -> ``0.00001``; exponent syntax on input is
+    not established for the camera)."""
+    if isinstance(v, str):
+        return '"' + v.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    if isinstance(v, (float, np.floating)):
+        r = repr(float(v))          # what configure has always sent (20000.0); only an exponent form changes
+        return np.format_float_positional(float(v), trim='-') if 'e' in r or 'E' in r else r
+    if isinstance(v, dict):
+        return '{' + ', '.join(f'{k}:{_set_value(x)}' for k, x in v.items()) + '}'
+    return format_value(v)
 
 
 def format_number(fmt) -> str:

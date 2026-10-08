@@ -41,6 +41,12 @@ def test_set_line_forms():
     assert P.set_line('defc', {'bcount': 2}, ' ') == 'set defc {bcount:2}'
     assert P.set_line('meta.comment', 'two words') == 'set meta.comment:"two words"'
     assert P.set_line('defc.aexpcomp', -0.0385) == 'set defc.aexpcomp:-0.0385'
+    assert P.set_line('meta.name', '123') == 'set meta.name:"123"'          # a string stays a string
+    assert P.set_line('meta.name', 'say "hi"') == r'set meta.name:"say \"hi\""'
+    assert P.parse_value(P.set_line('meta.name', 'say "hi"').split(':', 1)[1]) == 'say "hi"'
+    assert P.set_line('defc', {'aexpcomp': 1e-5}, ' ') == 'set defc {aexpcomp:0.00001}'   # no exponent
+    assert P.set_line('defc', {'res': P.Resolution(256, 128), 'rate': 20000, 'exp': 40000}, ' ') == \
+        'set defc {res:256x128, rate:20000, exp:40000}'                  # configure's bytes, as before
     with pytest.raises(ValueError):
         P.set_line('x', 1, '=')
 

@@ -125,8 +125,10 @@ class CameraModel:
                     own.setdefault(k, v)
                 if name == 'info' and 'features' in value:    # the profile camera's feature list
                     self.info['features'] = value['features']
-                if name == 'irig' and isinstance(value.get('sec'), int):   # the clock starts where that camera's was
-                    self.rtc_offset = value['sec'] - time.time()
+                if name == 'irig':      # that camera's fields as answered; 'sec' then runs from where its clock was
+                    self.irig.update(value)
+                    if isinstance(value.get('sec'), int):
+                        self.rtc_offset = value['sec'] - time.time()
             elif name in ('auto', 'meta') and isinstance(value, dict):
                 setattr(self, name, value)                    # settable, like the real camera's
             elif not (name[0] == 'c' and name[1:].isdigit()):
