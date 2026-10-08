@@ -94,7 +94,10 @@ class CameraModel:
         self.cam = {'syncimg': 0, 'frdelay': 0, 'trigpol': 0, 'tsformat': 1, 'cines': ncines, 'membpp': 12,
                     'timezone': 0}
         self.rtc_offset = 0.0   # set by 'setrtc' (vendor software sends the PC clock on connect)
-        self.irig = {'flags': 0, 'sec': 0, 'yearbegin': 0}
+        self.irig = {'flags': 0, 'sec': 0, 'yearbegin': 0}   # 'sec' is answered live: time.time() + rtc_offset
+        self.auto: dict | None = None   # 'auto' and 'meta' exist only when a profile defines them
+        self.meta: dict | None = None
+        self.bref_started: float | None = None
         self.ncines = ncines
         self.cines = {}
         self.partition(ncines)
@@ -115,11 +118,18 @@ class CameraModel:
                 continue
             name = line.split(' : ', 1)[0].strip()
             value = P.parse_get(line)
-            own = {'info': self.info, 'cam': self.cam, 'hw': self.hw, 'eth': self.eth, 'irig': self.irig}.get(name)
+            own = {'info': self.info, 'cam': self.cam, 'hw': self.hw, 'eth': self.eth, 'irig': self.irig,
+                   'defc': self.defc}.get(name)
             if own is not None and isinstance(value, dict):
                 for k, v in value.items():
                     own.setdefault(k, v)
-            elif name != 'defc' and not (name[0] == 'c' and name[1:].isdigit()):
+                if name == 'info' and 'features' in value:    # the profile camera's feature list
+                    self.info['features'] = value['features']
+                if name == 'irig' and isinstance(value.get('sec'), int):   # the clock starts where that camera's was
+                    self.rtc_offset = value['sec'] - time.time()
+            elif name in ('auto', 'meta') and isinstance(value, dict):
+                setattr(self, name, value)                    # settable, like the real camera's
+            elif not (name[0] == 'c' and name[1:].isdigit()):
                 self.extra[name] = value
 
     def partition(self, n):
@@ -147,6 +157,8 @@ class CameraModel:
             out['adj'] = dict(self.NEUTRAL_ADJ)
             out['meta'] = {'crop': 0, 'ox': 0, 'oy': 0, 'w': r.width, 'h': r.height, 'resize': 0,
                            'ow': r.width, 'oh': r.height, 'tcrate': 0, 'pbrate': 0, 'trigtc': ''}
+            if 'meta' in cn:     # name / comment as they were when the cine was stored (PCC p.33)
+                out['meta'].update(cn['meta'])
         return out
 
     def record(self, c=None):
@@ -167,6 +179,24 @@ class CameraModel:
         self.cines[c] = {'state': ['WTR', 'DEF', 'ABL', 'ACT']}
         self.active = c
 
+    BREF_DURATION_S = 0.6   # simulated CSR length; bref_progress rises 1..99 during it, then reads 0
+
+    def bref_progress(self) -> int:
+        if self.bref_started is None:
+            return 0
+        f = (time.monotonic() - self.bref_started) / self.BREF_DURATION_S
+        if f >= 1:
+            self.bref_started = None
+            return 0
+        return max(1, min(99, int(100 * f)))
+
+    def settable(self) -> dict:
+        roots = {'defc': self.defc, 'cam': self.cam, 'info': self.info}
+        for name in ('auto', 'meta'):
+            if getattr(self, name) is not None:
+                roots[name] = getattr(self, name)
+        return roots
+
     def trigger(self):
         c = self.active
         if c == 0:
@@ -179,12 +209,23 @@ class CameraModel:
             'frcount': int(d['frcount']), 'res': d['res'], 'rate': d['rate'], 'exp': d['exp'],
             'ptframes': pt, 'trigsecs': int(now), 'trigfrac': int((now % 1) * 1e6),
         }
+        if self.meta is not None:
+            self.cines[c]['meta'] = {'name': self.meta.get('name', ''), 'comment': self.meta.get('comment', '')}
         nxt = next((k for k in range(c + 1, self.ncines + 1) if 'RDY' in self.cines[k]['state']), 0)
         self.active = nxt
         if nxt:
             self.cines[nxt]['state'] = ['WTR', 'DEF', 'ABL', 'ACT']
         else:
             self.cines[0]['state'] = ['RDY', 'DEF', 'PRE', 'ACT']
+
+
+def _same_kind(old, new) -> bool:
+    """int stays int, a float variable takes int or float, a string stays a string."""
+    if isinstance(old, str) or isinstance(new, str):
+        return isinstance(old, str) and isinstance(new, str)
+    if isinstance(old, float):
+        return isinstance(new, (int, float))
+    return isinstance(old, int) and isinstance(new, int)
 
 
 def format_struct(v, indent=0) -> str:
@@ -346,6 +387,11 @@ class Simulator:
                 secs = int(v['value']) if isinstance(v, dict) else int(v)
                 m.rtc_offset = secs - time.time()
                 return 'Ok!'
+            if cmd == 'bref':
+                if 'bref' not in m.info['features'].split():
+                    raise P.ProtocolError('unknown command bref')
+                m.bref_started = time.monotonic()
+                return 'Ok!'
         if cmd == 'startdata':
             port = self._port_arg(arg)
             s = socket.create_connection((peer, port), timeout=5)
@@ -387,7 +433,10 @@ class Simulator:
         if path.endswith('.*'):        # 'get defc.*' == 'get defc' (vendor software uses this form)
             path = path[:-2]
         parts = path.split('.')
-        roots = {**m.extra, 'info': m.info, 'defc': m.defc, 'cam': m.cam, 'hw': m.hw, 'eth': m.eth, 'irig': m.irig}
+        irig = dict(m.irig, sec=int(time.time() + m.rtc_offset))
+        if m.auto is not None:
+            m.auto['bref_progress'] = m.bref_progress()
+        roots = {**m.extra, **m.settable(), 'hw': m.hw, 'eth': m.eth, 'irig': irig}
         head = parts[0]
         if head in roots:
             node = roots[head]
@@ -418,25 +467,34 @@ class Simulator:
 
     def _set(self, arg):
         # 'set name value' or 'set name:value' (the vendor library sends the latter)
-        path, _, value = arg.partition(' ')
-        if not value and ':' in path:
-            path, _, value = path.partition(':')
+        colon, space = arg.find(':'), arg.find(' ')
+        if colon >= 0 and (space < 0 or colon < space):     # 'set meta.comment:"two words"'
+            path, _, value = arg.partition(':')
+        else:
+            path, _, value = arg.partition(' ')
         v = P.parse_value(value)
         m = self.model
+        roots = m.settable()
         if path in ('defc', 'cam') and isinstance(v, dict):
-            target = m.defc if path == 'defc' else m.cam
+            target = roots[path]
             for k, x in v.items():
                 if k not in target:
                     raise P.ProtocolError(f'name {path}.{k}  is unknown ')
                 target[k] = x
             return
-        head, _, leaf = path.partition('.')
-        target = {'defc': m.defc, 'cam': m.cam, 'info': m.info}.get(head)
-        if target is None or leaf not in target:
+        parts = path.split('.')
+        node = roots.get(parts[0])
+        for p in parts[1:-1]:
+            node = node.get(p) if isinstance(node, dict) else None
+        leaf = parts[-1]
+        if len(parts) < 2 or not isinstance(node, dict) or leaf not in node or isinstance(node[leaf], dict):
             raise P.ProtocolError(f'name {path}  is unknown ')
-        if head == 'info' and leaf != 'name':
+        if parts[0] == 'info' and leaf != 'name':
             raise P.ProtocolError('read only')
-        target[leaf] = v
+        if parts[0] in ('cam', 'auto', 'meta') and not _same_kind(node[leaf], v):
+            # stricter than any camera is known to be: catches a client sending the wrong type
+            raise P.ProtocolError(f'{path} expects {type(node[leaf]).__name__}, got {type(v).__name__}')
+        node[leaf] = v
 
     def _cine_frames(self, c, start, cnt):
         m = self.model

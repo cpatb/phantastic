@@ -262,6 +262,18 @@ def format_value(v) -> str:
     raise TypeError(f'cannot encode {type(v).__name__}')
 
 
+def set_line(name: str, value, sep: str = ':') -> str:
+    """The exact ``set`` command line for ``name`` = ``value``.
+
+    ``sep=':'`` gives ``set cam.timezone:18000``, the form the vendor SDK was captured sending for a
+    single variable (docs/captures); ``sep=' '`` gives ``set defc {...}``, the form Phantastic's
+    ``configure`` has always sent (and that a v2512 accepted, 2026-10-07).
+    """
+    if sep not in (':', ' '):
+        raise ValueError(f'separator must be ":" or " ", not {sep!r}')
+    return f'set {name}{sep}{format_value(value)}'
+
+
 def format_number(fmt) -> str:
     """Normalise an image format token or number to its token."""
     if isinstance(fmt, int):

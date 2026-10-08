@@ -80,6 +80,73 @@ def year_start(tsec: int) -> int:
                             tzinfo=_dt.timezone.utc).timestamp()) if tsec else 0
 
 
+# configure() keyword -> (defc variable, type). Types as a v2512 (fw 23070) answered 'get defc' (2026-10-07):
+# aexpcomp is the only float. Units of bperiod/shoff and the meaning of aexpmode values are NOT established.
+DEFC_KEYWORDS = {
+    'burst_count': ('bcount', int),          # PCC p.47: 0 disables burst mode
+    'burst_period': ('bperiod', int),        # PCC shows it in µs (p.47); the camera's unit is not verified
+    'shutter_offset': ('shoff', int),
+    'auto_exposure_mode': ('aexpmode', int),  # PCC p.41: on/off and Average / Spot / Center Weighted
+    'auto_exposure_comp': ('aexpcomp', float),  # PCC p.42: 0 = 50 % grey
+}
+
+
+def acquisition_update(resolution: tuple[int, int] | None = None, rate: float | None = None,
+                       exposure_ns: int | None = None, post_trigger: int | None = None,
+                       edr_exposure_ns: int | None = None, **more) -> dict:
+    """The ``defc`` fields ``configure`` sends: only the arguments that are not None, typed."""
+    upd = {}
+    if resolution is not None:
+        upd['res'] = P.Resolution(*resolution)
+    if rate is not None:
+        upd['rate'] = rate
+    if exposure_ns is not None:
+        upd['exp'] = int(exposure_ns)
+    if post_trigger is not None:
+        upd['ptframes'] = int(post_trigger)
+    if edr_exposure_ns is not None:
+        upd['edrexp'] = int(edr_exposure_ns)
+    for kw, v in more.items():
+        if kw not in DEFC_KEYWORDS:
+            raise TypeError(f'configure() got an unexpected keyword argument {kw!r}')
+        if v is None:
+            continue
+        name, typ = DEFC_KEYWORDS[kw]
+        if typ is int and (isinstance(v, bool) or not isinstance(v, (int, np.integer))):
+            raise TypeError(f'{kw} must be an integer, not {v!r}')
+        if typ is float and (isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating))):
+            raise TypeError(f'{kw} must be a number, not {v!r}')
+        upd[name] = typ(v)
+    return upd
+
+
+def _latin1(text: str) -> str:
+    """Text a cine SETUP string field can hold (latin-1); other characters become '?'."""
+    return text.encode('latin-1', 'replace').decode('latin-1')
+
+
+BREF_NO_PROGRESS_S = 3.0   # bref_progress still 0 this long after 'bref': stop polling, completion unconfirmed
+
+
+def bref_finished(readings: list[int], elapsed_s: float) -> tuple[bool, str] | None:
+    """Decide from the ``auto.bref_progress`` readings so far whether a CSR is over.
+
+    Returns None (keep polling), (True, why) when finished, or (False, why) when the readings cannot
+    confirm it. Assumed meaning (NOT verified on hardware): percent, 0 when idle, rising while the
+    black reference runs. Done = a reading of 100 or more, or a return to 0 after a non-zero reading.
+    """
+    if not readings:
+        return None
+    if readings[-1] >= 100:
+        return True, f'auto.bref_progress reached {readings[-1]}'
+    if readings[-1] == 0 and any(r > 0 for r in readings):
+        return True, f'auto.bref_progress rose to {max(readings)} and returned to 0'
+    if all(r == 0 for r in readings) and elapsed_s >= BREF_NO_PROGRESS_S:
+        return False, (f'auto.bref_progress stayed 0 for {elapsed_s:.1f} s: either the CSR finished inside the '
+                       '"bref" command or this camera does not report progress; completion NOT confirmed')
+    return None
+
+
 @dataclass
 class DiscoveredCamera:
     ip: str
@@ -281,8 +348,66 @@ class Camera:
     def get(self, name: str):
         return P.parse_get(self.command(f'get {name}'))
 
-    def set(self, name: str, value):
-        self.command(f'set {name} {P.format_value(value)}')
+    def set(self, name: str, value, sep: str = ':'):
+        """Set one camera variable and return the camera's read-back (``get name``).
+
+        Every ``set`` Phantastic sends goes through here (``configure`` too), so the session log
+        holds each one with what the camera reported afterwards. ``sep``: see :func:`protocol.set_line`.
+        """
+        line = P.set_line(name, value, sep)
+        self.command(line)
+        back = self.get(name)
+        self.note(f'   set {name}: requested {P.format_value(value)}, camera reads back {P.format_value(back)}'
+                  if not isinstance(back, dict) else f'   set {name}: read back {len(back)} fields')
+        return back
+
+    def set_clock(self, unix_seconds: int):
+        """Set the camera's real-time clock (``setrtc <unix seconds>``, as the vendor SDK sends it on
+        every connect, docs/captures). This moves the time stamps of every later recording; the GUI
+        sends it only from Set Time after a confirmation (PCC p.30-32). Returns ``irig.sec`` read back,
+        or None when the camera has no such variable."""
+        self.command(f'setrtc {int(unix_seconds)}')
+        return self._safe_get('irig.sec')
+
+    def black_reference(self, progress: Callable[[int, int], None] | None = None,
+                        timeout: float = 60.0, poll: float = 0.2) -> dict:
+        """CSR (PCC p.34): ``bref``, then poll ``auto.bref_progress`` until :func:`bref_finished` says done.
+
+        The meaning of ``bref_progress`` is not documented in Phantastic's sources: read as percent
+        (0-100), done when it reaches 100 or falls back to 0 after a non-zero reading. If it never
+        leaves 0 the result says so (``confirmed`` False): the CSR may have finished inside the
+        ``bref`` call, or the camera does not report progress. Returns
+        dict(confirmed, reason, readings). Raises TimeoutError after ``timeout`` seconds.
+        """
+        self.command('bref')
+        readings: list[int] = []
+        t0 = time.monotonic()
+        while True:
+            v = self.get('auto.bref_progress')
+            readings.append(int(v))
+            if progress:
+                progress(min(max(int(v), 0), 100), 100)
+            state = bref_finished(readings, time.monotonic() - t0)
+            if state is not None:
+                if progress and state[0]:
+                    progress(100, 100)
+                return dict(confirmed=state[0], reason=state[1], readings=readings)
+            if time.monotonic() - t0 > timeout:
+                raise TimeoutError(f'CSR not finished after {timeout} s (auto.bref_progress readings {readings[-5:]})')
+            time.sleep(poll)
+
+    def cine_meta(self, cine: int) -> dict:
+        """Name and description for a downloaded cine: ``c#.meta.name`` / ``c#.meta.comment`` when the
+        camera answers them (the per-recording copy), else ``meta.name`` / ``meta.comment`` (the
+        camera's current setting, which may have changed since the recording). ``source`` says which;
+        None when neither exists."""
+        for prefix in (f'c{int(cine)}.meta', 'meta'):
+            try:
+                name, comment = self.get(f'{prefix}.name'), self.get(f'{prefix}.comment')
+            except P.ProtocolError:
+                continue
+            return dict(name=str(name), comment=str(comment), source=prefix)
+        return dict(name='', comment='', source=None)
 
     # ------------------------------------------------------------- high level
     def info(self) -> dict:
@@ -300,25 +425,17 @@ class Camera:
 
     def configure(self, resolution: tuple[int, int] | None = None, rate: float | None = None,
                   exposure_ns: int | None = None, post_trigger: int | None = None,
-                  edr_exposure_ns: int | None = None) -> dict:
+                  edr_exposure_ns: int | None = None, **more) -> dict:
         """Set acquisition parameters atomically (one ``set defc {...}``) and read them back.
 
-        The camera may round values (e.g. exposure to its clock); the read-back is returned so
-        the caller sees what will actually be used.
+        Only the arguments given are sent (see :func:`acquisition_update` for the further keywords:
+        burst, shutter offset, auto exposure). The camera may round values (e.g. exposure to its
+        clock); the read-back is returned so the caller sees what will actually be used.
         """
-        upd = {}
-        if resolution is not None:
-            upd['res'] = P.Resolution(*resolution)
-        if rate is not None:
-            upd['rate'] = rate
-        if exposure_ns is not None:
-            upd['exp'] = int(exposure_ns)
-        if post_trigger is not None:
-            upd['ptframes'] = int(post_trigger)
-        if edr_exposure_ns is not None:
-            upd['edrexp'] = int(edr_exposure_ns)
+        upd = acquisition_update(resolution=resolution, rate=rate, exposure_ns=exposure_ns,
+                                 post_trigger=post_trigger, edr_exposure_ns=edr_exposure_ns, **more)
         if upd:
-            self.command(f'set defc {P.format_value(upd)}')
+            return self.set('defc', upd, sep=' ')
         return self.acquisition()
 
     def cine_states(self) -> dict:
@@ -568,7 +685,8 @@ class Camera:
         if as_12bit:
             bits = 12
         serial = self._safe_get('info.serial', 0)
-        desc = (f'{description}\nPhantastic download: format {fmt} '
+        meta = self.cine_meta(cine)      # PCC p.33: the cine's Name and Description
+        desc =(f'{description}\nPhantastic download: format {fmt} '
                 f'({"camera-corrected FPN/PRNU" if P.IMAGE_FORMATS[fmt][2] else "uncorrected"}), '
                 f'step {step} align {align}; '
                 + ('12-bit, PCC layout: values = transmitted value >> 4 (any correction fraction below '
@@ -593,6 +711,9 @@ class Camera:
                       RealBPP=12 if fmt == 'P10' else bits, BlackLevel=black, WhiteLevel=white,
                       Serial=int(serial or 0), Description=desc,
                       fGain=1.0, fGamma=1.0, fSaturation=1.0, fGain16_8=1.0, fGainR=1.0, fGainG=1.0, fGainB=1.0)
+        if meta['source'] and meta['name']:
+            fields['CineName'] = _latin1(meta['name'])
+            fields['Description'] += f' CineName from camera {meta["source"]}.name.'
         frac64 = int(tfrac_us * (1 << 32) // 1_000_000)
         if not have_times:
             fields['Description'] += ' Time stamps SYNTHESIZED from image number / frame rate (camera gave none).'
@@ -607,6 +728,11 @@ class Camera:
         out_first, offset = renumbering(numbers, step) if step > 1 else (int(numbers[0]), 0)
         if step > 1:
             fields['Description'] += f' Image k = camera image k*{step}+{offset} (a cine numbers images consecutively).'
+        if meta['source'] and meta['comment']:
+            # after Phantastic's own notes, so a long camera text (up to 4096 characters, PCC p.33) can
+            # only truncate itself, never the record of how the pixels were stored
+            fields['Description'] += f'\nCamera description ({meta["source"]}.comment):\n{meta["comment"]}'
+        fields['Description'] = _latin1(fields['Description'])
         try:
             dropped, filled = self._write_download(path, (out_w, out_h), numbers, packing, out_first, fields, tsec,
                                                    frac64, ci, have_times, cine, fmt, chunk, year0, as_12bit,
