@@ -165,6 +165,7 @@ def test_csr_confirms_and_follows_progress(win, monkeypatch):
     settle()
     assert writes(win) == []
     monkeypatch.setattr(QMessageBox, 'question', lambda *a, **k: QMessageBox.StandardButton.Ok)
+    live.settings.structs = {}        # settings read not back yet: progress support is asked in the job (review)
     live.csr_btn.click()
     assert not live.csr_progress.isHidden()
     wait_until(lambda: live.last_csr is not None, what='CSR done')
@@ -278,3 +279,39 @@ def test_live_flag_fill_is_display_only(app):
     panel.flag_value = None                                        # 8-bit live: no fill
     panel._flag_src = None
     assert panel.display_source()[4, 4] == FLAG_P16
+
+
+def test_abort_while_triggered_recording_fills_asks(win, monkeypatch):
+    from phantastic import protocol as P
+    live = win.live_tab
+    asked = []
+
+    def no(*a, **k):
+        asked.append(a[1])
+        return QMessageBox.StandardButton.No
+    monkeypatch.setattr(QMessageBox, 'warning', no)
+    n = len(win.simulator.model.received)
+    live._capture_decided(True, None, {'c0': P.Flags(('RDY',)), 'c1': P.Flags(('TRG', 'DEF', 'ACT'))})
+    settle()
+    assert asked and 'rec 0' not in win.simulator.model.received[n:]
+    asked.clear()
+    live._capture_decided(True, None, {'c1': P.Flags(('WTR', 'DEF', 'ABL', 'ACT'))})   # only waiting: no question
+    wait_until(lambda: 'rec 0' in win.simulator.model.received[n:], what='rec 0')
+    assert asked == []
+
+
+def test_trigger_area_uses_the_resolution_after_apply(win):
+    live = win.live_tab
+    assert live._live_size() == (256, 256)
+    live.set_resolution(128, 64)
+    live.apply_btn.click()
+    wait_until(lambda: live._live_size() == (128, 64), what='settings re-read after Cine Settings Apply')
+    live.set_ibat_rect((0, 0, 32, 16))
+    assert [int(live.ibat_form.fields[f'auto.trigger.{k}'].text()) for k in 'xywh'] == \
+        list(CS.roi_to_camera(0, 0, 32, 16, 128, 64))
+
+
+def test_multiline_text_cannot_be_applied(win):
+    form = win.live_tab.meta_form
+    edit(form, 'meta.comment', 'line 1\nline 2')
+    assert not form.apply_btn.isEnabled() and 'control characters' in form.preview.text()

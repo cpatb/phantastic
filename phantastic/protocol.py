@@ -279,6 +279,9 @@ def _set_value(v) -> str:
     and a float is written without an exponent (``1e-05`` -> ``0.00001``; exponent syntax on input is
     not established for the camera)."""
     if isinstance(v, str):
+        bad = [c for c in v if ord(c) < 0x20 or ord(c) == 0x7F]
+        if bad:      # a line break would end the command; how the camera escapes them is not known
+            raise ValueError(f'control character {bad[0]!r} cannot be sent in a set command')
         return '"' + v.replace('\\', '\\\\').replace('"', '\\"') + '"'
     if isinstance(v, (float, np.floating)):
         r = repr(float(v))          # what configure has always sent (20000.0); only an exponent form changes

@@ -497,6 +497,7 @@ class LiveTab(QWidget):
             exp_txt = f'{int(exp) / NS_PER_US:g} µs ({int(exp)} ns)' if exp is not None else '-'
             self.readback_label.setText(f'Camera accepted: {_fmt(d.get("res"))}, {_fmt(d.get("rate"))} fps, '
                                         f'exposure {exp_txt}, {_fmt(d.get("ptframes"))} post-trigger frames')
+            self.settings.read()     # 'get' only: the auto-trigger area is converted with the new resolution
         return self._run('Settings applied', lambda cam: cam.configure(**req), show)
 
     def selected_cine(self) -> int | None:
@@ -508,17 +509,49 @@ class LiveTab(QWidget):
         self.cine_combo.setCurrentIndex(max(0, self.cine_combo.findData(cine or 0)))
 
     def capture(self):
-        """Capture, or Abort Recording (``rec 0``) while recording."""
-        if self.recording:
-            return self._run('Recording aborted (rec 0, back to preview)', lambda cam: cam.preview())
-        cine = self.selected_cine()
+        """Capture, or Abort Recording (``rec 0``) while recording.
+
+        The cine states are read fresh (``cstats``) before anything is sent: Capture into a cine holding a
+        stored recording, or Abort while a triggered recording is still filling, asks first. Capture into an
+        empty cine or the next free one, and Abort while only waiting for a trigger, erase no recording and
+        do not ask."""
         session = self.session
-        if cine and 'STR' in flags(self.cine_states.get(f'c{cine}')):
+        if session is None:
+            self.error.emit('Not connected')
+            return None
+        abort, cine = self.recording, self.selected_cine()
+
+        def job(task):
+            with session.use() as cam:
+                return cam.cine_states()
+
+        def done(states):
+            if session is self.session:
+                self.cine_states = states
+                self._update_cines()
+                self._capture_decided(abort, cine, states)
+
+        def failed(e):
+            self.error.emit(f'Capture: cannot read the cine states: {describe_error(e)}')
+        return self.tasks.submit(job, done, failed)
+
+    def _capture_decided(self, abort: bool, cine: int | None, states: dict):
+        session = self.session
+        ask = QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        if abort:
+            filling = [k for k, st in states.items() if int(k[1:]) >= 1 and 'TRG' in flags(st) and 'STR' not in flags(st)]
+            if filling and QMessageBox.warning(
+                    self, 'Abort a triggered recording?',
+                    f'{", ".join(filling)} was triggered and is still recording post-trigger images. Abort (rec 0) may '
+                    'lose that recording. Abort anyway?', ask, QMessageBox.StandardButton.No) \
+                    != QMessageBox.StandardButton.Yes:
+                return None
+            return self._run('Recording aborted (rec 0, back to preview)', lambda cam: cam.preview())
+        if cine and 'STR' in flags(states.get(f'c{cine}')):
             if QMessageBox.warning(self, 'Erase the recording in this cine?',
                                    f'Cine {cine} holds a stored recording. Capture into cine {cine} ERASES it '
                                    '(save it first if you need it). Record into it anyway?',
-                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                   QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                                   ask, QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
                 return None
 
         def rec(cam):
@@ -550,13 +583,17 @@ class LiveTab(QWidget):
                                 QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel) \
                 != QMessageBox.StandardButton.Ok:
             return None
-        has_progress = 'auto.bref_progress' in CS.flatten('auto', self.settings.structs.get('auto', {}), {})
         self.csr_btn.setEnabled(False)
         self.csr_progress.setValue(0)
         self.csr_progress.setVisible(True)
 
         def job(task):
             with session.use() as cam:
+                try:
+                    cam.get('auto.bref_progress')
+                    has_progress = True
+                except P.ProtocolError:
+                    has_progress = False
                 if not has_progress:
                     cam.command('bref')
                     return dict(confirmed=False, reason='this camera does not report auto.bref_progress; '

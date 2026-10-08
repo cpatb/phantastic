@@ -195,6 +195,9 @@ def parse(setting: Setting, text: str):
             text.encode('latin-1')
         except UnicodeEncodeError:
             raise ValueError(f'{setting.key}: the camera protocol carries latin-1 text only') from None
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in text):
+            raise ValueError(f'{setting.key}: line breaks, tabs and other control characters cannot be sent '
+                             '(the command is one line; the camera\'s escape for them is not known)')
         return text
     t = text.strip()
     try:

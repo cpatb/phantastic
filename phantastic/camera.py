@@ -120,6 +120,10 @@ def acquisition_update(resolution: tuple[int, int] | None = None, rate: float | 
     return upd
 
 
+DESCRIPTION_MAX = 4095          # cine SETUP Description: 4096 bytes including the terminating NUL
+TRUNCATED = ' [...truncated]'
+
+
 def _latin1(text: str) -> str:
     """Text a cine SETUP string field can hold (latin-1); other characters become '?'."""
     return text.encode('latin-1', 'replace').decode('latin-1')
@@ -711,7 +715,8 @@ class Camera:
                       RealBPP=12 if fmt == 'P10' else bits, BlackLevel=black, WhiteLevel=white,
                       Serial=int(serial or 0), Description=desc,
                       fGain=1.0, fGamma=1.0, fSaturation=1.0, fGain16_8=1.0, fGainR=1.0, fGainG=1.0, fGainB=1.0)
-        if meta['source'] and meta['name']:
+        if meta['source'] and meta['source'] != 'meta' and meta['name']:
+            # only the recording's own copy (c#.meta.name): the current meta.name may already name the NEXT shot
             fields['CineName'] = _latin1(meta['name'])
             fields['Description'] += f' CineName from camera {meta["source"]}.name.'
         frac64 = int(tfrac_us * (1 << 32) // 1_000_000)
@@ -731,8 +736,16 @@ class Camera:
         if meta['source'] and meta['comment']:
             # after Phantastic's own notes, so a long camera text (up to 4096 characters, PCC p.33) can
             # only truncate itself, never the record of how the pixels were stored
-            fields['Description'] += f'\nCamera description ({meta["source"]}.comment):\n{meta["comment"]}'
+            fields['Description'] += f'\nCamera description ({meta["source"]}.comment'
+            if meta['source'] == 'meta':
+                fields['Description'] += ', the camera\'s CURRENT setting: this camera gave no per-cine copy, so it ' \
+                                         'may have been changed since the recording'
+            fields['Description'] += f'):\n{meta["comment"]}'
+            if meta['source'] == 'meta' and meta['name']:
+                fields['Description'] += f'\nCurrent camera name (meta.name, not written as CineName): {meta["name"]}'
         fields['Description'] = _latin1(fields['Description'])
+        if len(fields['Description']) > DESCRIPTION_MAX:     # the SETUP field holds 4095 bytes + NUL
+            fields['Description'] = fields['Description'][:DESCRIPTION_MAX - len(TRUNCATED)] + TRUNCATED
         try:
             dropped, filled = self._write_download(path, (out_w, out_h), numbers, packing, out_first, fields, tsec,
                                                    frac64, ci, have_times, cine, fmt, chunk, year0, as_12bit,

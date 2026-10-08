@@ -225,3 +225,28 @@ def test_backup_round_trip_and_diff(cam, tmp_path):
     bad.write_text('{"settings": {}}', encoding='utf-8')
     with pytest.raises(ValueError, match='not a Phantastic'):
         CS.load_backup(bad)
+
+
+def test_control_characters_are_refused():
+    # a raw line break would end the command and send the rest as a second one (review finding)
+    with pytest.raises(ValueError, match='control character'):
+        P.set_line('meta.comment', 'line 1\nline 2')
+    with pytest.raises(ValueError, match='control characters'):
+        CS.parse(CS.BY_KEY['meta.comment'], 'a\tb')
+
+
+def test_cinename_only_from_the_recordings_own_copy(sim, cam, tmp_path):
+    cam.command('set defc {frcount:10, ptframes:2}')
+    cam.record(1)
+    cam.trigger()
+    cam.wait_stored(1, timeout=2)
+    sim.model.cines[1].pop('meta')            # a camera without a per-cine name: only meta.* answers
+    cam.set('meta.name', 'next shot')
+    cam.set('meta.comment', 'x' * 5000)       # longer than the 4095-byte SETUP field
+    out = tmp_path / 'fallback.cine'
+    cam.download(1, out)
+    with CineReader(out) as r:
+        assert r.setup['CineName'] == ''      # the current meta.name may name the NEXT recording: not written
+        d = r.setup['Description']
+        assert d.startswith('Phantastic download') and 'CURRENT setting' in d
+        assert len(d) == 4095 and d.endswith('[...truncated]')   # a cut is visible, never silent
